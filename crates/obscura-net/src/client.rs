@@ -8,6 +8,7 @@ use reqwest::{Client, Method};
 use tokio::sync::RwLock;
 use url::Url;
 
+use crate::blocklist::BlocklistConfig;
 use crate::cookies::CookieJar;
 use crate::interceptor::{InterceptAction, RequestInterceptor};
 
@@ -200,6 +201,7 @@ pub struct ObscuraHttpClient {
     pub timeout: Duration,
     pub in_flight: Arc<std::sync::atomic::AtomicU32>,
     pub block_trackers: bool,
+    pub tracker_blocklist_config: BlocklistConfig,
 }
 
 impl ObscuraHttpClient {
@@ -226,6 +228,7 @@ impl ObscuraHttpClient {
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             timeout: Duration::from_secs(30),
             block_trackers: false,
+            tracker_blocklist_config: BlocklistConfig::default(),
         }
     }
 
@@ -273,15 +276,9 @@ impl ObscuraHttpClient {
         let mut body = initial_body;
         if self.block_trackers {
             if let Some(host) = url.host_str() {
-                if crate::blocklist::is_blocked(host) {
+                if crate::blocklist::is_blocked_with_config(host, &self.tracker_blocklist_config) {
                     tracing::debug!("Blocked tracker: {}", url);
-                    return Ok(Response {
-                        status: 0,
-                        url: url.clone(),
-                        headers: HashMap::new(),
-                        body: Vec::new(),
-                        redirected_from: Vec::new(),
-                    });
+                    return Ok(synthetic_blocked_response(url));
                 }
             }
         }
@@ -448,6 +445,46 @@ impl ObscuraHttpClient {
 impl Default for ObscuraHttpClient {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn blocked_tracker_script_gets_synthetic_success_response() {
+        let mut client = ObscuraHttpClient::new();
+        client.block_trackers = true;
+
+        let url = Url::parse("https://www.google-analytics.com/ga.js").unwrap();
+        let response = client.fetch(&url).await.unwrap();
+
+        assert_eq!(response.status, 200);
+        assert_ne!(response.status, 0);
+        assert_eq!(
+            response.header("content-type"),
+            Some("application/javascript; charset=utf-8")
+        );
+        assert_eq!(response.header("cache-control"), Some("no-store"));
+        assert!(response.body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn blocked_tracker_json_gets_minimal_json_body() {
+        let mut client = ObscuraHttpClient::new();
+        client.block_trackers = true;
+
+        let url = Url::parse("https://doubleclick.net/events/config.json").unwrap();
+        let response = client.fetch(&url).await.unwrap();
+
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            response.header("content-type"),
+            Some("application/json; charset=utf-8")
+        );
+        assert_eq!(response.header("cache-control"), Some("no-store"));
+        assert_eq!(response.body, b"{}");
     }
 }
 

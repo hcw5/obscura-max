@@ -115,6 +115,28 @@ impl Page {
             "Browser-like traffic requires stealth transport. Enable the `stealth` feature and construct the page with stealth mode enabled.".to_string(),
         ))
     }
+
+    async fn do_subresource_fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
+        Self::do_subresource_fetch_with_clients(
+            self.http_client.clone(),
+            #[cfg(feature = "stealth")]
+            self.stealth_client.clone(),
+            url,
+        )
+        .await
+    }
+
+    async fn do_subresource_fetch_with_clients(
+        http_client: Arc<ObscuraHttpClient>,
+        #[cfg(feature = "stealth")] stealth_client: Option<Arc<StealthHttpClient>>,
+        url: &Url,
+    ) -> Result<Response, ObscuraNetError> {
+        #[cfg(feature = "stealth")]
+        if let Some(stealth) = stealth_client {
+            return stealth.fetch(url).await;
+        }
+        http_client.fetch(url).await
+    }
     fn init_js(&mut self) {
         if self.js.is_some() {
             let url_str = self.url_string();
@@ -230,23 +252,37 @@ impl Page {
             None => return,
         };
 
-        let mut regular = Vec::new();
-        let mut deferred = Vec::new();
-        let mut async_scripts = Vec::new();
+        let resolve_script_url = |src: &str, base: Option<&Url>| -> String {
+            if src.starts_with("http://") || src.starts_with("https://") {
+                src.to_string()
+            } else if let Some(base) = base {
+                base.join(src)
+                    .map(|u| u.to_string())
+                    .unwrap_or_else(|_| src.to_string())
+            } else {
+                src.to_string()
+            }
+        };
 
-        let mut module_scripts = Vec::new();
+        let mut parser_blocking_classic = Vec::new();
+        let mut defer_classic = Vec::new();
+        let mut async_classic = Vec::new();
+        let mut defer_module = Vec::new();
+        let mut async_module = Vec::new();
 
         for script in all_scripts {
             if script.is_module {
-                module_scripts.push(script);
-                continue;
-            }
-            if script.is_defer {
-                deferred.push(script);
+                if script.is_async {
+                    async_module.push(script);
+                } else {
+                    defer_module.push(script);
+                }
             } else if script.is_async {
-                async_scripts.push(script);
+                async_classic.push(script);
+            } else if script.is_defer {
+                defer_classic.push(script);
             } else {
-                regular.push(script);
+                parser_blocking_classic.push(script);
             }
         }
 
@@ -280,12 +316,53 @@ impl Page {
                     src_url.clone()
                 };
 
+        for script in &parser_blocking_classic {
+            if let Some(src) = &script.src {
+                let full_url = resolve_script_url(src, self.url.as_ref());
                 if self.should_block_url(&full_url) {
-                    tracing::info!("Blocked script by interception: {}", full_url);
+                    tracing::info!(
+                        "Blocked parser-blocking script by interception: {}",
+                        full_url
+                    );
                     continue;
                 }
-                resolved.push((i, full_url.clone()));
-                fetch_tasks.push((i, full_url));
+                let parsed =
+                    Url::parse(&full_url).unwrap_or_else(|_| Url::parse("about:blank").unwrap());
+                match self.do_fetch(&parsed).await {
+                    Ok(resp) => {
+                        let code = String::from_utf8_lossy(&resp.body).to_string();
+                        self.record_network_event(
+                            &full_url,
+                            "GET",
+                            "Script",
+                            resp.status,
+                            &resp.headers,
+                            resp.body.len(),
+                        );
+                        if let Some(js) = &mut self.js {
+                            if let Err(e) = js.execute_script_guarded(&full_url, &code) {
+                                tracing::warn!(
+                                    "Parser-blocking script error ({}): {}",
+                                    full_url,
+                                    e
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to fetch parser-blocking script {}: {}",
+                            full_url,
+                            e
+                        );
+                    }
+                }
+            } else if !script.inline.trim().is_empty() {
+                if let Some(js) = &mut self.js {
+                    if let Err(e) = js.execute_script_guarded("<inline>", &script.inline) {
+                        tracing::warn!("Inline parser-blocking script error: {}", e);
+                    }
+                }
             }
         }
 
@@ -337,14 +414,25 @@ impl Page {
                             tracing::warn!("Script error ({}): {}", url, e);
                         }
                     }
+                    Err(e) => {
+                        tracing::warn!("Failed to fetch module script {}: {}", full_url, e);
+                    }
                 }
-            } else if !script.inline.is_empty() {
-                if let Some(js) = &mut self.js {
-                    if let Err(e) = js.execute_script_guarded("<inline>", &script.inline) {
-                        tracing::warn!("Inline script error: {}", e);
+            } else if !script.inline.trim().is_empty() {
+                let base = page.url_string();
+                if let Some(js) = &mut page.js {
+                    if let Err(e) = js.load_inline_module(&script.inline, &base).await {
+                        tracing::warn!("Inline module script error: {}", e);
                     }
                 }
             }
+        };
+
+        for script in &defer_classic {
+            execute_defer_classic(script, self).await;
+        }
+        for script in &defer_module {
+            execute_module_script(script, self).await;
         }
 
         for module_script in &module_scripts {
@@ -376,14 +464,99 @@ impl Page {
                         Err(e) => {
                             tracing::warn!("ES module error ({}): {}", full_url, e);
                         }
-                    }
+                    });
+                } else if !script.inline.trim().is_empty() {
+                    async_jobs.push(async move {
+                        Some(AsyncResult::ClassicInline {
+                            code: script.inline,
+                        })
+                    });
                 }
-            } else if !module_script.inline.is_empty() {
-                let base = self.url_string();
-                if let Some(js) = &mut self.js {
-                    if let Err(e) = js.load_inline_module(&module_script.inline, &base).await {
-                        tracing::warn!("Inline ES module error: {}", e);
+            }
+
+            for script in async_module {
+                if let Some(src) = script.src {
+                    let full_url = resolve_script_url(&src, self.url.as_ref());
+                    if self.should_block_url(&full_url) {
+                        tracing::info!("Blocked async module by interception: {}", full_url);
+                        continue;
                     }
+                    let client = self.http_client.clone();
+                    async_jobs.push(async move {
+                        let parsed = Url::parse(&full_url)
+                            .unwrap_or_else(|_| Url::parse("about:blank").unwrap());
+                        match client.fetch(&parsed).await {
+                            Ok(response) => Some(AsyncResult::ModuleExternal {
+                                url: full_url,
+                                response,
+                            }),
+                            Err(e) => {
+                                tracing::warn!("Failed to fetch async module {}: {}", full_url, e);
+                                None
+                            }
+                        }
+                    });
+                } else if !script.inline.trim().is_empty() {
+                    async_jobs.push(async move {
+                        Some(AsyncResult::ModuleInline {
+                            code: script.inline,
+                        })
+                    });
+                }
+            }
+
+            while let Some(result) = async_jobs.next().await {
+                match result {
+                    Some(AsyncResult::ClassicExternal {
+                        url,
+                        response,
+                        code,
+                    }) => {
+                        self.record_network_event(
+                            &url,
+                            "GET",
+                            "Script",
+                            response.status,
+                            &response.headers,
+                            response.body.len(),
+                        );
+                        if let Some(js) = &mut self.js {
+                            if let Err(e) = js.execute_script_guarded(&url, &code) {
+                                tracing::warn!("Async script error ({}): {}", url, e);
+                            }
+                        }
+                    }
+                    Some(AsyncResult::ClassicInline { code }) => {
+                        if let Some(js) = &mut self.js {
+                            if let Err(e) = js.execute_script_guarded("<inline>", &code) {
+                                tracing::warn!("Inline async script error: {}", e);
+                            }
+                        }
+                    }
+                    Some(AsyncResult::ModuleExternal { url, response }) => {
+                        self.record_network_event(
+                            &url,
+                            "GET",
+                            "Script",
+                            response.status,
+                            &response.headers,
+                            response.body.len(),
+                        );
+                        if let Some(js) = &mut self.js {
+                            if let Err(e) = js.load_module(&url).await {
+                                tracing::warn!("Async module script error ({}): {}", url, e);
+                            }
+                        }
+                    }
+                    Some(AsyncResult::ModuleInline { code }) => {
+                        let base = self.url_string();
+                        if let Some(js) = &mut self.js {
+                            if let Err(e) = js.load_inline_module(&code, &base).await {
+                                tracing::warn!("Inline async module script error: {}", e);
+                            }
+                        }
+                    }
+                    None => {}
                 }
             }
         }
@@ -950,5 +1123,176 @@ pub enum PageError {
 impl From<ObscuraNetError> for PageError {
     fn from(e: ObscuraNetError) -> Self {
         PageError::NetworkError(e.to_string())
+    }
+}
+
+#[cfg(all(test, feature = "stealth"))]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    use crate::context::BrowserContext;
+
+    use super::Page;
+
+    #[derive(Debug, Clone)]
+    struct RequestLog {
+        path: String,
+        x_client: Option<String>,
+    }
+
+    async fn spawn_test_server() -> (String, Arc<tokio::sync::Mutex<Vec<RequestLog>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{}", addr);
+        let logs: Arc<tokio::sync::Mutex<Vec<RequestLog>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let logs_for_task = logs.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let accepted = tokio::time::timeout(
+                    tokio::time::Duration::from_millis(800),
+                    listener.accept(),
+                )
+                .await;
+                let (mut socket, _) = match accepted {
+                    Ok(Ok(pair)) => pair,
+                    _ => break,
+                };
+                let mut buf = vec![0u8; 4096];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                let mut lines = request.lines();
+                let request_line = lines.next().unwrap_or_default();
+                let path = request_line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("/")
+                    .to_string();
+                let x_client = request
+                    .lines()
+                    .find_map(|line| line.strip_prefix("x-client:").map(str::trim))
+                    .map(ToString::to_string);
+
+                logs_for_task.lock().await.push(RequestLog {
+                    path: path.clone(),
+                    x_client,
+                });
+
+                let (content_type, body) = if path == "/script.js" {
+                    (
+                        "application/javascript",
+                        "window.__obscura_script_loaded = true;",
+                    )
+                } else {
+                    (
+                        "text/html",
+                        "<!doctype html><html><head><script src=\"/script.js\"></script></head><body>ok</body></html>",
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    content_type,
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+
+        (base_url, logs)
+    }
+
+    #[tokio::test]
+    async fn stealth_uses_stealth_client_for_document_and_script_fetches() {
+        let (base_url, request_logs) = spawn_test_server().await;
+        let context = Arc::new(BrowserContext::with_options(
+            "ctx-stealth".to_string(),
+            None,
+            true,
+        ));
+        let mut page = Page::new("page-stealth".to_string(), context.clone());
+
+        let mut normal_headers = HashMap::new();
+        normal_headers.insert("x-client".to_string(), "http".to_string());
+        context.http_client.set_extra_headers(normal_headers).await;
+
+        let mut stealth_headers = HashMap::new();
+        stealth_headers.insert("x-client".to_string(), "stealth".to_string());
+        page.stealth_client
+            .as_ref()
+            .unwrap()
+            .set_extra_headers(stealth_headers)
+            .await;
+
+        page.navigate(&format!("{}/", base_url)).await.unwrap();
+
+        let logs = request_logs.lock().await.clone();
+        assert!(logs.iter().any(|log| log.path == "/"));
+        assert!(logs.iter().any(|log| log.path == "/script.js"));
+        for log in logs
+            .iter()
+            .filter(|log| log.path == "/" || log.path == "/script.js")
+        {
+            assert_eq!(log.x_client.as_deref(), Some("stealth"));
+        }
+
+        let document_event = page
+            .network_events
+            .iter()
+            .find(|event| event.resource_type == "Document")
+            .unwrap();
+        assert_eq!(document_event.status, 200);
+        assert!(document_event.body_size > 0);
+
+        let script_event = page
+            .network_events
+            .iter()
+            .find(|event| event.resource_type == "Script" && event.url.ends_with("/script.js"))
+            .unwrap();
+        assert_eq!(script_event.status, 200);
+        assert!(script_event.body_size > 0);
+        assert_eq!(
+            script_event
+                .response_headers
+                .get("content-type")
+                .map(String::as_str),
+            Some("application/javascript")
+        );
+    }
+
+    #[tokio::test]
+    async fn subresource_helper_uses_stealth_client_when_enabled() {
+        let (base_url, request_logs) = spawn_test_server().await;
+        let context = Arc::new(BrowserContext::with_options(
+            "ctx-stealth-helper".to_string(),
+            None,
+            true,
+        ));
+        let page = Page::new("page-stealth-helper".to_string(), context.clone());
+
+        let mut normal_headers = HashMap::new();
+        normal_headers.insert("x-client".to_string(), "http".to_string());
+        context.http_client.set_extra_headers(normal_headers).await;
+
+        let mut stealth_headers = HashMap::new();
+        stealth_headers.insert("x-client".to_string(), "stealth".to_string());
+        page.stealth_client
+            .as_ref()
+            .unwrap()
+            .set_extra_headers(stealth_headers)
+            .await;
+
+        let url = Url::parse(&format!("{}/script.js", base_url)).unwrap();
+        let response = page.do_subresource_fetch(&url).await.unwrap();
+        assert_eq!(response.status, 200);
+
+        let logs = request_logs.lock().await.clone();
+        let script_log = logs.iter().find(|log| log.path == "/script.js").unwrap();
+        assert_eq!(script_log.x_client.as_deref(), Some("stealth"));
     }
 }

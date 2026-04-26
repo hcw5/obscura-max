@@ -59,6 +59,46 @@ if (_origStackDesc && _origStackDesc.get) {
 }
 
 let _fpSeed = 0;
+let _fpSessionSeed = null;
+let _webglProfile = null;
+
+const _WEBGL_PROFILES = [
+  {
+    vendor: 'Google Inc. (NVIDIA)',
+    renderer: 'ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)',
+    glVendor: 'WebKit',
+    glRenderer: 'WebKit WebGL',
+    glVersion: 'OpenGL ES 3.0 (ANGLE 2.1.22438)',
+    shadingLanguageVersion: 'WebGL GLSL ES 3.00 (ANGLE 2.1.22438)',
+    extensions: ['WEBGL_debug_renderer_info', 'EXT_texture_filter_anisotropic', 'WEBGL_compressed_texture_s3tc', 'OES_element_index_uint', 'OES_standard_derivatives', 'WEBGL_lose_context'],
+  },
+  {
+    vendor: 'Google Inc. (Intel)',
+    renderer: 'ANGLE (Intel, Intel(R) Iris(R) Xe Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)',
+    glVendor: 'WebKit',
+    glRenderer: 'WebKit WebGL',
+    glVersion: 'OpenGL ES 3.0 (ANGLE 2.1.22017)',
+    shadingLanguageVersion: 'WebGL GLSL ES 3.00 (ANGLE 2.1.22017)',
+    extensions: ['WEBGL_debug_renderer_info', 'EXT_texture_filter_anisotropic', 'WEBGL_compressed_texture_s3tc', 'OES_element_index_uint', 'OES_standard_derivatives', 'WEBGL_lose_context'],
+  },
+  {
+    vendor: 'Google Inc. (AMD)',
+    renderer: 'ANGLE (AMD, AMD Radeon RX 6700 XT Direct3D11 vs_5_0 ps_5_0, D3D11)',
+    glVendor: 'WebKit',
+    glRenderer: 'WebKit WebGL',
+    glVersion: 'OpenGL ES 3.0 (ANGLE 2.1.23134)',
+    shadingLanguageVersion: 'WebGL GLSL ES 3.00 (ANGLE 2.1.23134)',
+    extensions: ['WEBGL_debug_renderer_info', 'EXT_texture_filter_anisotropic', 'WEBGL_compressed_texture_s3tc', 'OES_element_index_uint', 'OES_standard_derivatives', 'WEBGL_lose_context'],
+  },
+];
+
+function _getWebGLProfile() {
+  if (_webglProfile) return _webglProfile;
+  const idx = Math.floor(_fpRand(4242) * _WEBGL_PROFILES.length);
+  _webglProfile = _WEBGL_PROFILES[idx];
+  return _webglProfile;
+}
+
 function _fpRand(salt) {
   let h = (_fpSeed ^ (salt || 0)) | 0;
   h = Math.imul(h ^ (h >>> 16), 0x45d9f3b);
@@ -72,35 +112,14 @@ function _fpNoise(x, y, channel) {
 var _fpCache = null;
 function _getFp() {
   if (_fpCache) return _fpCache;
-  const gpuPool = [
-    'ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)',
-    'ANGLE (NVIDIA, NVIDIA GeForce GTX 1660 SUPER Direct3D11 vs_5_0 ps_5_0, D3D11)',
-    'ANGLE (NVIDIA, NVIDIA GeForce RTX 2070 SUPER Direct3D11 vs_5_0 ps_5_0, D3D11)',
-    'ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)',
-    'ANGLE (Intel, Intel(R) Iris(R) Xe Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)',
-    'ANGLE (AMD, AMD Radeon RX 580 Direct3D11 vs_5_0 ps_5_0, D3D11)',
-    'ANGLE (AMD, AMD Radeon RX 6700 XT Direct3D11 vs_5_0 ps_5_0, D3D11)',
-    'ANGLE (NVIDIA, NVIDIA GeForce RTX 4070 Direct3D11 vs_5_0 ps_5_0, D3D11)',
-    'ANGLE (NVIDIA, NVIDIA GeForce GTX 1080 Ti Direct3D11 vs_5_0 ps_5_0, D3D11)',
-    'ANGLE (Intel, Intel(R) UHD Graphics 770 Direct3D11 vs_5_0 ps_5_0, D3D11)',
-    'ANGLE (AMD, AMD Radeon RX 5700 XT Direct3D11 vs_5_0 ps_5_0, D3D11)',
-    'ANGLE (NVIDIA, NVIDIA GeForce RTX 3080 Direct3D11 vs_5_0 ps_5_0, D3D11)',
-  ];
-  const gpuVendorPool = [
-    'Google Inc. (NVIDIA)','Google Inc. (NVIDIA)','Google Inc. (NVIDIA)',
-    'Google Inc. (Intel)','Google Inc. (Intel)',
-    'Google Inc. (AMD)','Google Inc. (AMD)',
-    'Google Inc. (NVIDIA)','Google Inc. (NVIDIA)',
-    'Google Inc. (Intel)','Google Inc. (AMD)','Google Inc. (NVIDIA)',
-  ];
-  const idx = Math.floor(_fpRand(42) * gpuPool.length);
+  const webgl = _getWebGLProfile();
   const screenPool = [[1920,1080],[2560,1440],[1366,768],[1536,864],[1440,900],[1680,1050],[1280,720],[3840,2160]];
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
   let cfp = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUg';
   for (let i = 0; i < 40; i++) cfp += chars[Math.floor(_fpRand(500 + i) * 64)];
   cfp += '==';
   _fpCache = {
-    gpu: gpuPool[idx], gpuVendor: gpuVendorPool[idx],
+    gpu: webgl.renderer, gpuVendor: webgl.vendor,
     audioBaseLatency: 0.002 + _fpRand(100) * 0.008,
     audioSampleRate: [44100, 48000][Math.floor(_fpRand(101) * 2)],
     compThreshold: -24 + (_fpRand(102) - 0.5) * 4,
@@ -351,6 +370,13 @@ class Element extends Node {
     super(nid);
     this._style = _styleProxy(new CSSStyleDeclaration());
   }
+  _isHtmlNamespace() {
+    return this.namespaceURI === "http://www.w3.org/1999/xhtml";
+  }
+  _normalizeAttrName(name) {
+    const s = String(name ?? "");
+    return this._isHtmlNamespace() ? s.toLowerCase() : s;
+  }
   get tagName() { return _domParse("tag_name", this._nid) || ""; }
   get localName() { return (this.tagName || "").toLowerCase(); }
   get id() { return this.getAttribute("id") || ""; }
@@ -365,7 +391,7 @@ class Element extends Node {
   get innerHTML() { return _domParse("inner_html", this._nid) ?? ""; }
   set innerHTML(v) { _dom("set_inner_html", this._nid, String(v ?? "")); }
   get outerHTML() { return _domParse("outer_html", this._nid) ?? ""; }
-  get innerText() { return this.textContent; }
+  get innerText() { return _computeInnerText(this); }
   set innerText(v) { this.textContent = v; }
   get children() {
     const ids = _domParse("element_children", this._nid) || [];
@@ -392,17 +418,29 @@ class Element extends Node {
   }
   get style() { return this._style; }
   set style(v) { if (typeof v === "string") this._style.cssText = v; }
-  getAttribute(n) { return _domParse("get_attribute", this._nid, n); }
+  getAttribute(n) { return _domParse("get_attribute", this._nid, this._normalizeAttrName(n)); }
   setAttribute(n, v) {
-    _dom("set_attribute", this._nid, n + "\0" + String(v));
-    if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('attributes', this._nid, [], [], n);
+    const normalized = this._normalizeAttrName(n);
+    _dom("set_attribute", this._nid, normalized + "\0" + String(v));
+    if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('attributes', this._nid, [], [], normalized);
   }
-  setAttributeNS(ns, n, v) { this.setAttribute(n, v); } // Simplified NS handling
-  removeAttribute(n) { _dom("remove_attribute", this._nid, n); }
-  removeAttributeNS(ns, n) { this.removeAttribute(n); }
+  setAttributeNS(ns, n, v) {
+    const namespace = ns == null ? "" : String(ns);
+    const qualifiedName = String(n ?? "");
+    _dom("set_attribute_ns", this._nid, namespace + "\0" + qualifiedName + "\0" + String(v));
+    if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('attributes', this._nid, [], [], qualifiedName);
+  }
+  removeAttribute(n) { _dom("remove_attribute", this._nid, this._normalizeAttrName(n)); }
+  removeAttributeNS(ns, n) {
+    const namespace = ns == null ? "" : String(ns);
+    _dom("remove_attribute_ns", this._nid, namespace + "\0" + String(n ?? ""));
+  }
   hasAttribute(n) { return this.getAttribute(n) !== null; }
   hasAttributes() { return true; } // Simplified
-  getAttributeNS(ns, n) { return this.getAttribute(n); }
+  getAttributeNS(ns, n) {
+    const namespace = ns == null ? "" : String(ns);
+    return _domParse("get_attribute_ns", this._nid, namespace + "\0" + String(n ?? ""));
+  }
   querySelector(s) { return _wrapEl(+_dom("query_selector", s)); }
   querySelectorAll(s) {
     const ids = _domParse("query_selector_all", s) || [];
@@ -696,6 +734,61 @@ class Element extends Node {
   after() {} before() {} remove() { if (this.parentNode) this.parentNode.removeChild(this); }
   append(...nodes) { for (const n of nodes) { if (typeof n === "string") this.appendChild(document.createTextNode(n)); else this.appendChild(n); } }
   prepend() {}
+}
+
+const _innerTextBlockTags = new Set([
+  "address", "article", "aside", "blockquote", "canvas", "dd", "div", "dl", "dt", "fieldset",
+  "figcaption", "figure", "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6", "header",
+  "hr", "li", "main", "nav", "noscript", "ol", "p", "pre", "section", "table", "tfoot", "ul",
+  "video", "tr", "td", "th"
+]);
+
+function _isInnerTextHidden(node) {
+  if (!node || node.nodeType !== Node.ELEMENT_NODE) return false;
+  if (node.hasAttribute && node.hasAttribute("hidden")) return true;
+  const style = globalThis.getComputedStyle ? globalThis.getComputedStyle(node) : null;
+  if (!style) return false;
+  const display = (style.display || "").toLowerCase();
+  const visibility = (style.visibility || "").toLowerCase();
+  return display === "none" || visibility === "hidden";
+}
+
+function _computeInnerText(root) {
+  const out = [];
+  const pushNewline = () => {
+    if (out.length === 0 || out[out.length - 1] === "\n") return;
+    out.push("\n");
+  };
+  const walk = (node) => {
+    if (!node) return;
+    if (node.nodeType === Node.TEXT_NODE) {
+      out.push(node.textContent || "");
+      return;
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE) return;
+    if (_isInnerTextHidden(node)) return;
+
+    const tag = (node.tagName || "").toLowerCase();
+    if (tag === "br") {
+      pushNewline();
+      return;
+    }
+    const isBlock = _innerTextBlockTags.has(tag);
+    if (isBlock) pushNewline();
+
+    const children = node.childNodes || [];
+    for (const child of children) walk(child);
+
+    if (isBlock) pushNewline();
+  };
+
+  walk(root);
+  return out
+    .join("")
+    .replace(/\r\n?/g, "\n")
+    .replace(/[ \t\f\v]+/g, " ")
+    .replace(/ *\n+ */g, "\n")
+    .trim();
 }
 
 class Document extends Node {
@@ -2301,22 +2394,36 @@ Element.prototype.getContext = function getContext(type) {
     return this._ctx;
   }
   if (type === 'webgl' || type === 'experimental-webgl' || type === 'webgl2') {
+    const profile = _getWebGLProfile();
+    const extensionSet = new Set(profile.extensions);
     return {
       canvas: this,
       getExtension(name) {
-        if (name === 'WEBGL_debug_renderer_info') return { UNMASKED_VENDOR_WEBGL: 0x9245, UNMASKED_RENDERER_WEBGL: 0x9246 };
-        return null;
+        if (!extensionSet.has(name)) return null;
+        if (name === 'WEBGL_debug_renderer_info') {
+          return { UNMASKED_VENDOR_WEBGL: 0x9245, UNMASKED_RENDERER_WEBGL: 0x9246 };
+        }
+        if (name === 'EXT_texture_filter_anisotropic') {
+          return {
+            TEXTURE_MAX_ANISOTROPY_EXT: 0x84FE,
+            MAX_TEXTURE_MAX_ANISOTROPY_EXT: 0x84FF,
+          };
+        }
+        if (name === 'WEBGL_lose_context') {
+          return { loseContext() {}, restoreContext() {} };
+        }
+        return {};
       },
       getParameter(pname) {
-        if (pname === 0x9245) return _fp('gpuVendor');
-        if (pname === 0x9246) return _fp('gpu');
-        if (pname === 0x1F01) return 'WebKit WebGL';  // GL_RENDERER
-        if (pname === 0x1F00) return 'WebKit';          // GL_VENDOR
-        if (pname === 0x1F02) return 'OpenGL ES 3.0 (ANGLE)'; // GL_VERSION
-        if (pname === 0x8B8C) return 'WebGL GLSL ES 3.00 (ANGLE)'; // GL_SHADING_LANGUAGE_VERSION
+        if (pname === 0x9245 && extensionSet.has('WEBGL_debug_renderer_info')) return profile.vendor;
+        if (pname === 0x9246 && extensionSet.has('WEBGL_debug_renderer_info')) return profile.renderer;
+        if (pname === 0x1F01) return profile.glRenderer; // GL_RENDERER
+        if (pname === 0x1F00) return profile.glVendor; // GL_VENDOR
+        if (pname === 0x1F02) return profile.glVersion; // GL_VERSION
+        if (pname === 0x8B8C) return profile.shadingLanguageVersion; // GL_SHADING_LANGUAGE_VERSION
         return 0;
       },
-      getSupportedExtensions() { return ['WEBGL_debug_renderer_info','EXT_texture_filter_anisotropic','WEBGL_compressed_texture_s3tc','WEBGL_lose_context']; },
+      getSupportedExtensions() { return profile.extensions.slice(); },
       getShaderPrecisionFormat() { return { rangeMin: 127, rangeMax: 127, precision: 23 }; },
       createBuffer() { return {}; }, createShader() { return {}; }, createProgram() { return {}; },
       shaderSource() {}, compileShader() {}, attachShader() {}, linkProgram() {},
@@ -2906,8 +3013,13 @@ if (typeof Document !== 'undefined' && !Document.prototype.importNode) {
 }
 
 globalThis.__obscura_init = function() {
-  _fpSeed = Date.now() ^ (Math.random() * 0xFFFFFFFF >>> 0);
+  if (_fpSessionSeed === null) {
+    _fpSessionSeed = Date.now() ^ (Math.random() * 0xFFFFFFFF >>> 0);
+  }
+  _fpSeed = _fpSessionSeed;
   _fpCache = null;
+  _webglProfile = null;
+  _getWebGLProfile();
 
   globalThis.document = new Document(+_dom("document_node_id"));
 
