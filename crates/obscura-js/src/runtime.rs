@@ -912,6 +912,115 @@ mod tests {
         assert_eq!(chrome, serde_json::json!("object"));
     }
 
+    #[test]
+    fn test_webgl_profile_is_internally_consistent() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(function () {
+                    const canvas = document.createElement('canvas');
+                    const gl = canvas.getContext('webgl');
+                    const ext = gl.getSupportedExtensions();
+                    const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+                    return {
+                      extensions: ext,
+                      vendor: gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL),
+                      renderer: gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL),
+                      glVendor: gl.getParameter(0x1F00),
+                      glRenderer: gl.getParameter(0x1F01),
+                      glVersion: gl.getParameter(0x1F02),
+                      glslVersion: gl.getParameter(0x8B8C),
+                      missing: gl.getExtension('WEBGL_not_real_extension'),
+                    };
+                })()"#,
+            )
+            .unwrap();
+
+        let obj = result.as_object().unwrap();
+        let extensions = obj.get("extensions").unwrap().as_array().unwrap();
+        assert!(
+            extensions.contains(&serde_json::json!("WEBGL_debug_renderer_info")),
+            "debug extension should be advertised"
+        );
+        assert!(
+            extensions.contains(&serde_json::json!("EXT_texture_filter_anisotropic")),
+            "anisotropic extension should be advertised"
+        );
+        assert!(
+            obj.get("vendor").unwrap().as_str().unwrap().contains("Google Inc."),
+            "unmasked vendor should be coherent: {:?}",
+            obj.get("vendor")
+        );
+        assert!(
+            obj.get("renderer").unwrap().as_str().unwrap().contains("ANGLE"),
+            "unmasked renderer should be coherent: {:?}",
+            obj.get("renderer")
+        );
+        assert_eq!(obj.get("glVendor").unwrap(), &serde_json::json!("WebKit"));
+        assert_eq!(obj.get("glRenderer").unwrap(), &serde_json::json!("WebKit WebGL"));
+        assert!(
+            obj.get("glVersion")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .contains("ANGLE"),
+            "GL_VERSION should align with ANGLE profile"
+        );
+        assert!(
+            obj.get("glslVersion")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .contains("ANGLE"),
+            "GLSL version should align with ANGLE profile"
+        );
+        assert_eq!(obj.get("missing").unwrap(), &serde_json::Value::Null);
+    }
+
+    #[test]
+    fn test_webgl_profile_persists_across_reload_within_session() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let before = rt
+            .evaluate(
+                r#"(function () {
+                    const gl = document.createElement('canvas').getContext('webgl');
+                    const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+                    return {
+                      extensions: gl.getSupportedExtensions().slice().sort(),
+                      vendor: gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL),
+                      renderer: gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL),
+                      glVersion: gl.getParameter(0x1F02),
+                      glslVersion: gl.getParameter(0x8B8C),
+                    };
+                })()"#,
+            )
+            .unwrap();
+
+        rt.execute_script(
+            "<reset>",
+            "globalThis.document = new Document(+_dom('document_node_id'));",
+        )
+        .unwrap();
+
+        let after = rt
+            .evaluate(
+                r#"(function () {
+                    const gl = document.createElement('canvas').getContext('webgl');
+                    const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+                    return {
+                      extensions: gl.getSupportedExtensions().slice().sort(),
+                      vendor: gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL),
+                      renderer: gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL),
+                      glVersion: gl.getParameter(0x1F02),
+                      glslVersion: gl.getParameter(0x8B8C),
+                    };
+                })()"#,
+            )
+            .unwrap();
+
+        assert_eq!(before, after, "webgl profile should remain stable within one runtime session");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn test_call_function_on_no_args() {
         let mut rt = setup_runtime("<html><head><title>Test</title></head><body></body></html>");
