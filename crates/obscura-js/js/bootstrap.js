@@ -370,6 +370,13 @@ class Element extends Node {
     super(nid);
     this._style = _styleProxy(new CSSStyleDeclaration());
   }
+  _isHtmlNamespace() {
+    return this.namespaceURI === "http://www.w3.org/1999/xhtml";
+  }
+  _normalizeAttrName(name) {
+    const s = String(name ?? "");
+    return this._isHtmlNamespace() ? s.toLowerCase() : s;
+  }
   get tagName() { return _domParse("tag_name", this._nid) || ""; }
   get localName() { return (this.tagName || "").toLowerCase(); }
   get id() { return this.getAttribute("id") || ""; }
@@ -411,17 +418,29 @@ class Element extends Node {
   }
   get style() { return this._style; }
   set style(v) { if (typeof v === "string") this._style.cssText = v; }
-  getAttribute(n) { return _domParse("get_attribute", this._nid, n); }
+  getAttribute(n) { return _domParse("get_attribute", this._nid, this._normalizeAttrName(n)); }
   setAttribute(n, v) {
-    _dom("set_attribute", this._nid, n + "\0" + String(v));
-    if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('attributes', this._nid, [], [], n);
+    const normalized = this._normalizeAttrName(n);
+    _dom("set_attribute", this._nid, normalized + "\0" + String(v));
+    if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('attributes', this._nid, [], [], normalized);
   }
-  setAttributeNS(ns, n, v) { this.setAttribute(n, v); } // Simplified NS handling
-  removeAttribute(n) { _dom("remove_attribute", this._nid, n); }
-  removeAttributeNS(ns, n) { this.removeAttribute(n); }
+  setAttributeNS(ns, n, v) {
+    const namespace = ns == null ? "" : String(ns);
+    const qualifiedName = String(n ?? "");
+    _dom("set_attribute_ns", this._nid, namespace + "\0" + qualifiedName + "\0" + String(v));
+    if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('attributes', this._nid, [], [], qualifiedName);
+  }
+  removeAttribute(n) { _dom("remove_attribute", this._nid, this._normalizeAttrName(n)); }
+  removeAttributeNS(ns, n) {
+    const namespace = ns == null ? "" : String(ns);
+    _dom("remove_attribute_ns", this._nid, namespace + "\0" + String(n ?? ""));
+  }
   hasAttribute(n) { return this.getAttribute(n) !== null; }
   hasAttributes() { return true; } // Simplified
-  getAttributeNS(ns, n) { return this.getAttribute(n); }
+  getAttributeNS(ns, n) {
+    const namespace = ns == null ? "" : String(ns);
+    return _domParse("get_attribute_ns", this._nid, namespace + "\0" + String(n ?? ""));
+  }
   querySelector(s) { return _wrapEl(+_dom("query_selector", s)); }
   querySelectorAll(s) {
     const ids = _domParse("query_selector_all", s) || [];
