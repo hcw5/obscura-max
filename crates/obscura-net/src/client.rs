@@ -64,63 +64,38 @@ pub enum ResourceType {
 pub type RequestCallback = Arc<dyn Fn(&RequestInfo) + Send + Sync>;
 pub type ResponseCallback = Arc<dyn Fn(&RequestInfo, &Response) + Send + Sync>;
 
-fn infer_resource_type(url: &Url) -> ResourceType {
-    let path = url.path().to_ascii_lowercase();
-    if path.ends_with(".js") || path.ends_with(".mjs") {
-        return ResourceType::Script;
-    }
-    if path.ends_with(".css") {
-        return ResourceType::Stylesheet;
-    }
-    if path.ends_with(".png")
-        || path.ends_with(".jpg")
-        || path.ends_with(".jpeg")
-        || path.ends_with(".gif")
-        || path.ends_with(".svg")
-        || path.ends_with(".webp")
-        || path.ends_with(".ico")
-    {
-        return ResourceType::Image;
-    }
-    if path.ends_with(".woff")
-        || path.ends_with(".woff2")
-        || path.ends_with(".ttf")
-        || path.ends_with(".otf")
-        || path.ends_with(".eot")
-    {
-        return ResourceType::Font;
-    }
-    if path.ends_with(".json") {
-        return ResourceType::Fetch;
-    }
-    if path.ends_with(".html") || path.ends_with(".htm") {
-        return ResourceType::Document;
-    }
-    ResourceType::Other
+fn non_fingerprintable_base_headers(ua: &str) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(USER_AGENT, HeaderValue::from_str(ua).unwrap_or_else(|_| {
+        HeaderValue::from_static(
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+        )
+    }));
+    // This reqwest path is intentionally non-browser-fingerprinted.
+    // Browser-fidelity traffic must use the StealthHttpClient (wreq).
+    headers.insert(reqwest::header::ACCEPT, HeaderValue::from_static("*/*"));
+    headers.insert(
+        HeaderName::from_static("x-obscura-client-profile"),
+        HeaderValue::from_static("non-fingerprintable"),
+    );
+    headers
 }
 
-fn synthetic_blocked_response(url: &Url) -> Response {
-    let resource_type = infer_resource_type(url);
-    let (content_type, body) = match resource_type {
-        ResourceType::Document => ("text/html; charset=utf-8", b"<!doctype html>".to_vec()),
-        ResourceType::Script => ("application/javascript; charset=utf-8", Vec::new()),
-        ResourceType::Stylesheet => ("text/css; charset=utf-8", Vec::new()),
-        ResourceType::Image => ("image/gif", Vec::new()),
-        ResourceType::Font => ("font/woff2", Vec::new()),
-        ResourceType::Fetch | ResourceType::Xhr => ("application/json; charset=utf-8", b"{}".to_vec()),
-        ResourceType::Other => ("text/plain; charset=utf-8", Vec::new()),
-    };
+#[cfg(test)]
+mod tests {
+    use super::non_fingerprintable_base_headers;
 
-    let mut headers = HashMap::new();
-    headers.insert("content-type".to_string(), content_type.to_string());
-    headers.insert("cache-control".to_string(), "no-store".to_string());
-
-    Response {
-        status: 200,
-        url: url.clone(),
-        headers,
-        body,
-        redirected_from: Vec::new(),
+    #[test]
+    fn non_fingerprintable_profile_headers_are_stable() {
+        let headers = non_fingerprintable_base_headers("test-ua");
+        assert_eq!(
+            headers
+                .get("x-obscura-client-profile")
+                .and_then(|v| v.to_str().ok()),
+            Some("non-fingerprintable")
+        );
+        assert!(headers.get("sec-ch-ua").is_none());
+        assert!(headers.get("sec-fetch-mode").is_none());
     }
 }
 
@@ -341,52 +316,7 @@ impl ObscuraHttpClient {
             }
 
             let ua = self.user_agent.read().await.clone();
-            let mut headers = HeaderMap::new();
-            headers.insert(USER_AGENT, HeaderValue::from_str(&ua).unwrap_or_else(|_| {
-                HeaderValue::from_static("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36")
-            }));
-            headers.insert(
-                reqwest::header::ACCEPT,
-                HeaderValue::from_static("text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"),
-            );
-            headers.insert(
-                reqwest::header::ACCEPT_LANGUAGE,
-                HeaderValue::from_static("en-US,en;q=0.9"),
-            );
-            headers.insert(
-                HeaderName::from_static("sec-ch-ua"),
-                HeaderValue::from_static(
-                    "\"Chromium\";v=\"145\", \"Not;A=Brand\";v=\"24\", \"Google Chrome\";v=\"145\"",
-                ),
-            );
-            headers.insert(
-                HeaderName::from_static("sec-ch-ua-mobile"),
-                HeaderValue::from_static("?0"),
-            );
-            headers.insert(
-                HeaderName::from_static("sec-ch-ua-platform"),
-                HeaderValue::from_static("\"Linux\""),
-            );
-            headers.insert(
-                HeaderName::from_static("sec-fetch-dest"),
-                HeaderValue::from_static("document"),
-            );
-            headers.insert(
-                HeaderName::from_static("sec-fetch-mode"),
-                HeaderValue::from_static("navigate"),
-            );
-            headers.insert(
-                HeaderName::from_static("sec-fetch-site"),
-                HeaderValue::from_static("none"),
-            );
-            headers.insert(
-                HeaderName::from_static("sec-fetch-user"),
-                HeaderValue::from_static("?1"),
-            );
-            headers.insert(
-                HeaderName::from_static("upgrade-insecure-requests"),
-                HeaderValue::from_static("1"),
-            );
+            let mut headers = non_fingerprintable_base_headers(&ua);
 
             let cookie_header = self.cookie_jar.get_cookie_header(&current_url);
             if !cookie_header.is_empty() {
