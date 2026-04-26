@@ -365,7 +365,7 @@ class Element extends Node {
   get innerHTML() { return _domParse("inner_html", this._nid) ?? ""; }
   set innerHTML(v) { _dom("set_inner_html", this._nid, String(v ?? "")); }
   get outerHTML() { return _domParse("outer_html", this._nid) ?? ""; }
-  get innerText() { return this.textContent; }
+  get innerText() { return _computeInnerText(this); }
   set innerText(v) { this.textContent = v; }
   get children() {
     const ids = _domParse("element_children", this._nid) || [];
@@ -696,6 +696,61 @@ class Element extends Node {
   after() {} before() {} remove() { if (this.parentNode) this.parentNode.removeChild(this); }
   append(...nodes) { for (const n of nodes) { if (typeof n === "string") this.appendChild(document.createTextNode(n)); else this.appendChild(n); } }
   prepend() {}
+}
+
+const _innerTextBlockTags = new Set([
+  "address", "article", "aside", "blockquote", "canvas", "dd", "div", "dl", "dt", "fieldset",
+  "figcaption", "figure", "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6", "header",
+  "hr", "li", "main", "nav", "noscript", "ol", "p", "pre", "section", "table", "tfoot", "ul",
+  "video", "tr", "td", "th"
+]);
+
+function _isInnerTextHidden(node) {
+  if (!node || node.nodeType !== Node.ELEMENT_NODE) return false;
+  if (node.hasAttribute && node.hasAttribute("hidden")) return true;
+  const style = globalThis.getComputedStyle ? globalThis.getComputedStyle(node) : null;
+  if (!style) return false;
+  const display = (style.display || "").toLowerCase();
+  const visibility = (style.visibility || "").toLowerCase();
+  return display === "none" || visibility === "hidden";
+}
+
+function _computeInnerText(root) {
+  const out = [];
+  const pushNewline = () => {
+    if (out.length === 0 || out[out.length - 1] === "\n") return;
+    out.push("\n");
+  };
+  const walk = (node) => {
+    if (!node) return;
+    if (node.nodeType === Node.TEXT_NODE) {
+      out.push(node.textContent || "");
+      return;
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE) return;
+    if (_isInnerTextHidden(node)) return;
+
+    const tag = (node.tagName || "").toLowerCase();
+    if (tag === "br") {
+      pushNewline();
+      return;
+    }
+    const isBlock = _innerTextBlockTags.has(tag);
+    if (isBlock) pushNewline();
+
+    const children = node.childNodes || [];
+    for (const child of children) walk(child);
+
+    if (isBlock) pushNewline();
+  };
+
+  walk(root);
+  return out
+    .join("")
+    .replace(/\r\n?/g, "\n")
+    .replace(/[ \t\f\v]+/g, " ")
+    .replace(/ *\n+ */g, "\n")
+    .trim();
 }
 
 class Document extends Node {
