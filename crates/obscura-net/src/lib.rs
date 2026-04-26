@@ -6,7 +6,7 @@ pub mod robots;
 #[cfg(feature = "stealth")]
 pub mod wreq_client;
 
-pub use blocklist::{is_blocked as is_tracker_blocked, BlocklistConfig};
+pub use blocklist::{is_blocked as is_tracker_blocked, BlocklistConfig, BlocklistMode};
 pub use client::{ObscuraHttpClient, ObscuraNetError, RequestInfo, ResourceType, Response};
 pub use cookies::{CookieInfo, CookieJar};
 pub use robots::RobotsCache;
