@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -63,6 +62,66 @@ pub enum ResourceType {
 
 pub type RequestCallback = Arc<dyn Fn(&RequestInfo) + Send + Sync>;
 pub type ResponseCallback = Arc<dyn Fn(&RequestInfo, &Response) + Send + Sync>;
+
+fn infer_resource_type(url: &Url) -> ResourceType {
+    let path = url.path().to_ascii_lowercase();
+    if path.ends_with(".js") || path.ends_with(".mjs") {
+        return ResourceType::Script;
+    }
+    if path.ends_with(".css") {
+        return ResourceType::Stylesheet;
+    }
+    if path.ends_with(".png")
+        || path.ends_with(".jpg")
+        || path.ends_with(".jpeg")
+        || path.ends_with(".gif")
+        || path.ends_with(".svg")
+        || path.ends_with(".webp")
+        || path.ends_with(".ico")
+    {
+        return ResourceType::Image;
+    }
+    if path.ends_with(".woff")
+        || path.ends_with(".woff2")
+        || path.ends_with(".ttf")
+        || path.ends_with(".otf")
+        || path.ends_with(".eot")
+    {
+        return ResourceType::Font;
+    }
+    if path.ends_with(".json") {
+        return ResourceType::Fetch;
+    }
+    if path.ends_with(".html") || path.ends_with(".htm") {
+        return ResourceType::Document;
+    }
+    ResourceType::Other
+}
+
+fn synthetic_blocked_response(url: &Url) -> Response {
+    let resource_type = infer_resource_type(url);
+    let (content_type, body) = match resource_type {
+        ResourceType::Document => ("text/html; charset=utf-8", b"<!doctype html>".to_vec()),
+        ResourceType::Script => ("application/javascript; charset=utf-8", Vec::new()),
+        ResourceType::Stylesheet => ("text/css; charset=utf-8", Vec::new()),
+        ResourceType::Image => ("image/gif", Vec::new()),
+        ResourceType::Font => ("font/woff2", Vec::new()),
+        ResourceType::Fetch | ResourceType::Xhr => ("application/json; charset=utf-8", b"{}".to_vec()),
+        ResourceType::Other => ("text/plain; charset=utf-8", Vec::new()),
+    };
+
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), content_type.to_string());
+    headers.insert("cache-control".to_string(), "no-store".to_string());
+
+    Response {
+        status: 200,
+        url: url.clone(),
+        headers,
+        body,
+        redirected_from: Vec::new(),
+    }
+}
 
 fn validate_url(url: &Url) -> Result<(), ObscuraNetError> {
     let scheme = url.scheme();
@@ -239,13 +298,7 @@ impl ObscuraHttpClient {
             if let Some(host) = url.host_str() {
                 if crate::blocklist::is_blocked(host) {
                     tracing::debug!("Blocked tracker: {}", url);
-                    return Ok(Response {
-                        status: 0,
-                        url: url.clone(),
-                        headers: HashMap::new(),
-                        body: Vec::new(),
-                        redirected_from: Vec::new(),
-                    });
+                    return Ok(synthetic_blocked_response(url));
                 }
             }
         }
@@ -442,6 +495,46 @@ impl ObscuraHttpClient {
 impl Default for ObscuraHttpClient {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn blocked_tracker_script_gets_synthetic_success_response() {
+        let mut client = ObscuraHttpClient::new();
+        client.block_trackers = true;
+
+        let url = Url::parse("https://www.google-analytics.com/ga.js").unwrap();
+        let response = client.fetch(&url).await.unwrap();
+
+        assert_eq!(response.status, 200);
+        assert_ne!(response.status, 0);
+        assert_eq!(
+            response.header("content-type"),
+            Some("application/javascript; charset=utf-8")
+        );
+        assert_eq!(response.header("cache-control"), Some("no-store"));
+        assert!(response.body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn blocked_tracker_json_gets_minimal_json_body() {
+        let mut client = ObscuraHttpClient::new();
+        client.block_trackers = true;
+
+        let url = Url::parse("https://doubleclick.net/events/config.json").unwrap();
+        let response = client.fetch(&url).await.unwrap();
+
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            response.header("content-type"),
+            Some("application/json; charset=utf-8")
+        );
+        assert_eq!(response.header("cache-control"), Some("no-store"));
+        assert_eq!(response.body, b"{}");
     }
 }
 
