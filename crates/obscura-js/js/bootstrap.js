@@ -1835,9 +1835,28 @@ globalThis.IntersectionObserver = class {
 };
 globalThis.PerformanceObserver = class { constructor(){} observe(){} disconnect(){} };
 
+let __obscuraLastEventTs = 0;
+function __obscuraMonotonicEventTs() {
+  const now = (globalThis.performance && typeof globalThis.performance.now === "function")
+    ? globalThis.performance.now()
+    : Date.now();
+  if (!Number.isFinite(now)) {
+    __obscuraLastEventTs += 0.1;
+    return __obscuraLastEventTs;
+  }
+  __obscuraLastEventTs = Math.max(now, __obscuraLastEventTs + 0.01);
+  return __obscuraLastEventTs;
+}
+globalThis.__obscura_dispatch_event = function(target, event, opts = {}) {
+  if (!target || !event) return true;
+  event.__obscuraTrusted = opts.trusted !== false;
+  event.timeStamp = __obscuraMonotonicEventTs();
+  return target.dispatchEvent(event);
+};
+
 globalThis.Event = class Event {
-  constructor(t,o={}) { this.type=t;this.bubbles=!!o.bubbles;this.cancelable=!!o.cancelable;this.composed=!!o.composed;this.defaultPrevented=false;this.target=null;this.currentTarget=null;this.eventPhase=0;this.timeStamp=Date.now(); }
-  get isTrusted() { return true; }
+  constructor(t,o={}) { this.type=t;this.bubbles=!!o.bubbles;this.cancelable=!!o.cancelable;this.composed=!!o.composed;this.defaultPrevented=false;this.target=null;this.currentTarget=null;this.eventPhase=0;this.__obscuraTrusted=false;this.timeStamp=__obscuraMonotonicEventTs(); }
+  get isTrusted() { return !!this.__obscuraTrusted; }
   preventDefault() { this.defaultPrevented=true; } stopPropagation(){} stopImmediatePropagation(){}
   initEvent(type,bubbles,cancelable) { this.type=type;this.bubbles=!!bubbles;this.cancelable=!!cancelable; }
 };
@@ -1892,7 +1911,7 @@ globalThis.XMLSerializer = class XMLSerializer {
   }
 };
 globalThis.performance = globalThis.performance || {
-  now: () => Date.now(),
+  now: () => Date.now() - (globalThis.performance?.timeOrigin || 0),
   mark(){}, measure(){},
   clearMarks(){}, clearMeasures(){}, clearResourceTimings(){},
   getEntries(){return [];}, getEntriesByName(){return [];}, getEntriesByType(){return [];},
@@ -3034,6 +3053,7 @@ globalThis.__obscura_init = function() {
   const t0 = Date.now();
   globalThis.performance.timeOrigin = t0;
   globalThis.performance.timing = { navigationStart: t0, domContentLoadedEventEnd: t0, loadEventEnd: t0 };
+  __obscuraLastEventTs = 0;
 
   const hide = (obj, props) => {
     for (const p of props) {
