@@ -84,13 +84,21 @@ impl Page {
             return false;
         }
         for pattern in &self.intercept_block_patterns {
-            if pattern == "*" { return true; }
+            if pattern == "*" {
+                return true;
+            }
             if pattern.starts_with('*') && pattern.ends_with('*') {
-                if url.contains(&pattern[1..pattern.len()-1]) { return true; }
+                if url.contains(&pattern[1..pattern.len() - 1]) {
+                    return true;
+                }
             } else if pattern.starts_with('*') {
-                if url.ends_with(&pattern[1..]) { return true; }
+                if url.ends_with(&pattern[1..]) {
+                    return true;
+                }
             } else if pattern.ends_with('*') {
-                if url.starts_with(&pattern[..pattern.len()-1]) { return true; }
+                if url.starts_with(&pattern[..pattern.len() - 1]) {
+                    return true;
+                }
             } else if url.contains(pattern) {
                 return true;
             }
@@ -104,6 +112,28 @@ impl Page {
             return stealth.fetch(url).await;
         }
         self.http_client.fetch(url).await
+    }
+
+    async fn do_subresource_fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
+        Self::do_subresource_fetch_with_clients(
+            self.http_client.clone(),
+            #[cfg(feature = "stealth")]
+            self.stealth_client.clone(),
+            url,
+        )
+        .await
+    }
+
+    async fn do_subresource_fetch_with_clients(
+        http_client: Arc<ObscuraHttpClient>,
+        #[cfg(feature = "stealth")] stealth_client: Option<Arc<StealthHttpClient>>,
+        url: &Url,
+    ) -> Result<Response, ObscuraNetError> {
+        #[cfg(feature = "stealth")]
+        if let Some(stealth) = stealth_client {
+            return stealth.fetch(url).await;
+        }
+        http_client.fetch(url).await
     }
     fn init_js(&mut self) {
         if self.js.is_some() {
@@ -119,12 +149,14 @@ impl Page {
                 js.set_dom(d);
             }
 
-            let _ = js.execute_script("<reset>",
+            let _ = js.execute_script(
+                "<reset>",
                 "_cache.clear(); globalThis.__obscura_objects = {}; globalThis.__obscura_oid = 0; \
                  _iframeRegistry.length = 0; globalThis.length = 0; \
                  globalThis._formValues = {}; globalThis._formChecked = {}; \
                  globalThis._eventRegistry = {}; \
-                 globalThis.document = new Document(+_dom('document_node_id'));");
+                 globalThis.document = new Document(+_dom('document_node_id'));",
+            );
 
             return;
         }
@@ -159,7 +191,10 @@ impl Page {
     }
 
     async fn execute_scripts(&mut self) {
-        tracing::info!("execute_scripts called, js runtime exists: {}", self.js.is_some());
+        tracing::info!(
+            "execute_scripts called, js runtime exists: {}",
+            self.js.is_some()
+        );
 
         #[derive(Debug)]
         struct ScriptInfo {
@@ -171,8 +206,8 @@ impl Page {
         }
 
         let all_scripts = match &self.js {
-            Some(js) => {
-                js.with_dom(|dom| {
+            Some(js) => js
+                .with_dom(|dom| {
                     let script_ids = dom.query_selector_all("script").unwrap_or_default();
                     let mut scripts = Vec::new();
 
@@ -210,8 +245,8 @@ impl Page {
                         }
                     }
                     scripts
-                }).unwrap_or_default()
-            }
+                })
+                .unwrap_or_default(),
             None => return,
         };
 
@@ -237,8 +272,14 @@ impl Page {
 
         let scripts = regular;
 
-        tracing::info!("Found {} regular + {} deferred + {} async scripts", scripts.len(), deferred.len(), async_scripts.len());
-        let all_to_execute: Vec<ScriptInfo> = scripts.into_iter()
+        tracing::info!(
+            "Found {} regular + {} deferred + {} async scripts",
+            scripts.len(),
+            deferred.len(),
+            async_scripts.len()
+        );
+        let all_to_execute: Vec<ScriptInfo> = scripts
+            .into_iter()
             .chain(deferred.into_iter())
             .chain(async_scripts.into_iter())
             .collect();
@@ -248,10 +289,13 @@ impl Page {
 
         for (i, script) in all_to_execute.iter().enumerate() {
             if let Some(src_url) = &script.src {
-                let full_url = if src_url.starts_with("http://") || src_url.starts_with("https://") {
+                let full_url = if src_url.starts_with("http://") || src_url.starts_with("https://")
+                {
                     src_url.clone()
                 } else if let Some(base) = &self.url {
-                    base.join(src_url).map(|u| u.to_string()).unwrap_or_else(|_| src_url.clone())
+                    base.join(src_url)
+                        .map(|u| u.to_string())
+                        .unwrap_or_else(|_| src_url.clone())
                 } else {
                     src_url.clone()
                 };
@@ -266,25 +310,41 @@ impl Page {
         }
 
         let client = self.http_client.clone();
-        let fetch_futures: Vec<_> = fetch_tasks.iter().map(|(idx, url)| {
-            let client = client.clone();
-            let url = url.clone();
-            let idx = *idx;
-            async move {
-                let parsed = Url::parse(&url).unwrap_or_else(|_| Url::parse("about:blank").unwrap());
-                match client.fetch(&parsed).await {
-                    Ok(resp) => Some((idx, url, resp)),
-                    Err(e) => {
-                        tracing::warn!("Failed to fetch script {}: {}", url, e);
-                        None
+        #[cfg(feature = "stealth")]
+        let stealth_client = self.stealth_client.clone();
+        let fetch_futures: Vec<_> = fetch_tasks
+            .iter()
+            .map(|(idx, url)| {
+                let client = client.clone();
+                #[cfg(feature = "stealth")]
+                let stealth_client = stealth_client.clone();
+                let url = url.clone();
+                let idx = *idx;
+                async move {
+                    let parsed =
+                        Url::parse(&url).unwrap_or_else(|_| Url::parse("about:blank").unwrap());
+                    match Self::do_subresource_fetch_with_clients(
+                        client,
+                        #[cfg(feature = "stealth")]
+                        stealth_client,
+                        &parsed,
+                    )
+                    .await
+                    {
+                        Ok(resp) => Some((idx, url, resp)),
+                        Err(e) => {
+                            tracing::warn!("Failed to fetch script {}: {}", url, e);
+                            None
+                        }
                     }
                 }
-            }
-        }).collect();
+            })
+            .collect();
 
         let fetch_results = futures::future::join_all(fetch_futures).await;
 
-        let mut fetched: std::collections::HashMap<usize, (String, String, obscura_net::Response)> = std::collections::HashMap::new();
+        let mut fetched: std::collections::HashMap<usize, (String, String, obscura_net::Response)> =
+            std::collections::HashMap::new();
         for result in fetch_results {
             if let Some((idx, url, resp)) = result {
                 let code = String::from_utf8_lossy(&resp.body).to_string();
@@ -296,7 +356,14 @@ impl Page {
             if script.src.is_some() {
                 if let Some((url, code, resp)) = fetched.remove(&i) {
                     tracing::info!("Executing script ({} bytes): {}", code.len(), url);
-                    self.record_network_event(&url, "GET", "Script", resp.status, &resp.headers, resp.body.len());
+                    self.record_network_event(
+                        &url,
+                        "GET",
+                        "Script",
+                        resp.status,
+                        &resp.headers,
+                        resp.body.len(),
+                    );
                     if let Some(js) = &mut self.js {
                         if let Err(e) = js.execute_script_guarded(&url, &code) {
                             tracing::warn!("Script error ({}): {}", url, e);
@@ -317,7 +384,9 @@ impl Page {
                 let full_url = if src.starts_with("http://") || src.starts_with("https://") {
                     src.clone()
                 } else if let Some(base) = &self.url {
-                    base.join(src).map(|u| u.to_string()).unwrap_or_else(|_| src.clone())
+                    base.join(src)
+                        .map(|u| u.to_string())
+                        .unwrap_or_else(|_| src.clone())
                 } else {
                     src.clone()
                 };
@@ -327,7 +396,14 @@ impl Page {
                     match js.load_module(&full_url).await {
                         Ok(()) => {
                             tracing::info!("ES module loaded: {}", full_url);
-                            self.record_network_event(&full_url, "GET", "Script", 200, &std::collections::HashMap::new(), 0);
+                            self.record_network_event(
+                                &full_url,
+                                "GET",
+                                "Script",
+                                200,
+                                &std::collections::HashMap::new(),
+                                0,
+                            );
                         }
                         Err(e) => {
                             tracing::warn!("ES module error ({}): {}", full_url, e);
@@ -358,7 +434,8 @@ impl Page {
                 let result = tokio::time::timeout(
                     tokio::time::Duration::from_millis(10),
                     js.run_event_loop(),
-                ).await;
+                )
+                .await;
 
                 match result {
                     Ok(Ok(())) => {
@@ -386,7 +463,8 @@ impl Page {
     }
 
     pub async fn navigate(&mut self, url_str: &str) -> Result<(), PageError> {
-        self.navigate_with_wait(url_str, crate::lifecycle::WaitUntil::Load).await
+        self.navigate_with_wait(url_str, crate::lifecycle::WaitUntil::Load)
+            .await
     }
 
     pub async fn navigate_with_wait(
@@ -394,7 +472,8 @@ impl Page {
         url_str: &str,
         wait_until: crate::lifecycle::WaitUntil,
     ) -> Result<(), PageError> {
-        self.navigate_with_wait_post(url_str, wait_until, "GET", "").await
+        self.navigate_with_wait_post(url_str, wait_until, "GET", "")
+            .await
     }
 
     pub async fn navigate_with_wait_post(
@@ -408,9 +487,15 @@ impl Page {
         let mut current_method = method.to_string();
         let mut current_body = body.to_string();
         for _chain in 0..10 {
-            self.navigate_single(&current_url, wait_until, &current_method, &current_body).await?;
+            self.navigate_single(&current_url, wait_until, &current_method, &current_body)
+                .await?;
             if let Some((next_url, next_method, next_body)) = self.take_pending_navigation() {
-                tracing::info!("JS-triggered navigation chain: {} {} -> {}", current_method, current_url, next_url);
+                tracing::info!(
+                    "JS-triggered navigation chain: {} {} -> {}",
+                    current_method,
+                    current_url,
+                    next_url
+                );
                 current_url = next_url;
                 current_method = next_method;
                 current_body = next_body;
@@ -466,7 +551,8 @@ impl Page {
             self.http_client.post_form(&url, body).await
         } else {
             self.do_fetch(&url).await
-        }.map_err(|e| {
+        }
+        .map_err(|e| {
             self.lifecycle = LifecycleState::Failed;
             PageError::NetworkError(e.to_string())
         })?;
@@ -513,7 +599,9 @@ impl Page {
             let full_url = if href.starts_with("http://") || href.starts_with("https://") {
                 href.clone()
             } else if let Some(base) = &self.url {
-                base.join(href).map(|u| u.to_string()).unwrap_or_else(|_| href.clone())
+                base.join(href)
+                    .map(|u| u.to_string())
+                    .unwrap_or_else(|_| href.clone())
             } else {
                 href.clone()
             };
@@ -525,27 +613,38 @@ impl Page {
         }
 
         let client = self.http_client.clone();
-        let css_futures: Vec<_> = css_fetch_urls.iter().map(|full_url| {
-            let client = client.clone();
-            let url_str = full_url.clone();
-            async move {
-                let parsed = Url::parse(&url_str).unwrap_or_else(|_| Url::parse("about:blank").unwrap());
-                match client.fetch(&parsed).await {
-                    Ok(resp) => Some((url_str, resp)),
-                    Err(e) => {
-                        tracing::debug!("Failed to fetch stylesheet {}: {}", url_str, e);
-                        None
+        let css_futures: Vec<_> = css_fetch_urls
+            .iter()
+            .map(|full_url| {
+                let client = client.clone();
+                let url_str = full_url.clone();
+                async move {
+                    let parsed =
+                        Url::parse(&url_str).unwrap_or_else(|_| Url::parse("about:blank").unwrap());
+                    match client.fetch(&parsed).await {
+                        Ok(resp) => Some((url_str, resp)),
+                        Err(e) => {
+                            tracing::debug!("Failed to fetch stylesheet {}: {}", url_str, e);
+                            None
+                        }
                     }
                 }
-            }
-        }).collect();
+            })
+            .collect();
 
         let css_results = futures::future::join_all(css_futures).await;
         let mut css_sources = Vec::new();
         for result in css_results {
             if let Some((url_str, resp)) = result {
                 let css = String::from_utf8_lossy(&resp.body).to_string();
-                self.record_network_event(&url_str, "GET", "Stylesheet", resp.status, &resp.headers, resp.body.len());
+                self.record_network_event(
+                    &url_str,
+                    "GET",
+                    "Stylesheet",
+                    resp.status,
+                    &resp.headers,
+                    resp.body.len(),
+                );
                 css_sources.push(css);
             }
         }
@@ -609,7 +708,9 @@ impl Page {
                     if idle_since.is_none() {
                         idle_since = Some(now);
                     }
-                    if now.duration_since(idle_since.unwrap()) >= tokio::time::Duration::from_millis(500) {
+                    if now.duration_since(idle_since.unwrap())
+                        >= tokio::time::Duration::from_millis(500)
+                    {
                         break;
                     }
                 } else {
@@ -617,7 +718,10 @@ impl Page {
                 }
 
                 if now >= deadline {
-                    tracing::debug!("Network idle timeout reached with {} active requests", active);
+                    tracing::debug!(
+                        "Network idle timeout reached with {} active requests",
+                        active
+                    );
                     break;
                 }
 
@@ -625,7 +729,8 @@ impl Page {
                     let _ = tokio::time::timeout(
                         tokio::time::Duration::from_millis(50),
                         js.run_event_loop(),
-                    ).await;
+                    )
+                    .await;
                 } else {
                     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 }
@@ -640,7 +745,9 @@ impl Page {
     pub fn navigate_blank(&mut self) {
         self.js = None;
         self.url = Some(Url::parse("about:blank").unwrap());
-        self.dom = Some(parse_html("<!DOCTYPE html><html><head></head><body></body></html>"));
+        self.dom = Some(parse_html(
+            "<!DOCTYPE html><html><head></head><body></body></html>",
+        ));
         self.title = String::new();
         self.lifecycle = LifecycleState::Loaded;
     }
@@ -668,7 +775,11 @@ impl Page {
             match js.evaluate(expression) {
                 Ok(val) => val,
                 Err(e) => {
-                    tracing::debug!("JS eval error for '{}': {}", &expression[..expression.len().min(80)], e);
+                    tracing::debug!(
+                        "JS eval error for '{}': {}",
+                        &expression[..expression.len().min(80)],
+                        e
+                    );
                     serde_json::Value::Null
                 }
             }
@@ -730,7 +841,16 @@ impl Page {
         await_promise: bool,
     ) -> obscura_js::runtime::RemoteObjectInfo {
         if let Some(js) = &mut self.js {
-            match js.call_function_on_for_cdp(function_declaration, object_id, args, return_by_value, await_promise).await {
+            match js
+                .call_function_on_for_cdp(
+                    function_declaration,
+                    object_id,
+                    args,
+                    return_by_value,
+                    await_promise,
+                )
+                .await
+            {
                 Ok(info) => info,
                 Err(e) => {
                     tracing::debug!("callFunctionOn error: {}", e);
@@ -837,7 +957,10 @@ impl Page {
         }
     }
 
-    pub fn set_intercept_tx(&mut self, tx: tokio::sync::mpsc::UnboundedSender<obscura_js::ops::InterceptedRequest>) {
+    pub fn set_intercept_tx(
+        &mut self,
+        tx: tokio::sync::mpsc::UnboundedSender<obscura_js::ops::InterceptedRequest>,
+    ) {
         self.intercept_tx = Some(tx.clone());
         if let Some(js) = &self.js {
             js.set_intercept_tx(tx);
@@ -860,5 +983,176 @@ pub enum PageError {
 impl From<ObscuraNetError> for PageError {
     fn from(e: ObscuraNetError) -> Self {
         PageError::NetworkError(e.to_string())
+    }
+}
+
+#[cfg(all(test, feature = "stealth"))]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    use crate::context::BrowserContext;
+
+    use super::Page;
+
+    #[derive(Debug, Clone)]
+    struct RequestLog {
+        path: String,
+        x_client: Option<String>,
+    }
+
+    async fn spawn_test_server() -> (String, Arc<tokio::sync::Mutex<Vec<RequestLog>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{}", addr);
+        let logs: Arc<tokio::sync::Mutex<Vec<RequestLog>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let logs_for_task = logs.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let accepted = tokio::time::timeout(
+                    tokio::time::Duration::from_millis(800),
+                    listener.accept(),
+                )
+                .await;
+                let (mut socket, _) = match accepted {
+                    Ok(Ok(pair)) => pair,
+                    _ => break,
+                };
+                let mut buf = vec![0u8; 4096];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                let mut lines = request.lines();
+                let request_line = lines.next().unwrap_or_default();
+                let path = request_line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("/")
+                    .to_string();
+                let x_client = request
+                    .lines()
+                    .find_map(|line| line.strip_prefix("x-client:").map(str::trim))
+                    .map(ToString::to_string);
+
+                logs_for_task.lock().await.push(RequestLog {
+                    path: path.clone(),
+                    x_client,
+                });
+
+                let (content_type, body) = if path == "/script.js" {
+                    (
+                        "application/javascript",
+                        "window.__obscura_script_loaded = true;",
+                    )
+                } else {
+                    (
+                        "text/html",
+                        "<!doctype html><html><head><script src=\"/script.js\"></script></head><body>ok</body></html>",
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    content_type,
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+
+        (base_url, logs)
+    }
+
+    #[tokio::test]
+    async fn stealth_uses_stealth_client_for_document_and_script_fetches() {
+        let (base_url, request_logs) = spawn_test_server().await;
+        let context = Arc::new(BrowserContext::with_options(
+            "ctx-stealth".to_string(),
+            None,
+            true,
+        ));
+        let mut page = Page::new("page-stealth".to_string(), context.clone());
+
+        let mut normal_headers = HashMap::new();
+        normal_headers.insert("x-client".to_string(), "http".to_string());
+        context.http_client.set_extra_headers(normal_headers).await;
+
+        let mut stealth_headers = HashMap::new();
+        stealth_headers.insert("x-client".to_string(), "stealth".to_string());
+        page.stealth_client
+            .as_ref()
+            .unwrap()
+            .set_extra_headers(stealth_headers)
+            .await;
+
+        page.navigate(&format!("{}/", base_url)).await.unwrap();
+
+        let logs = request_logs.lock().await.clone();
+        assert!(logs.iter().any(|log| log.path == "/"));
+        assert!(logs.iter().any(|log| log.path == "/script.js"));
+        for log in logs
+            .iter()
+            .filter(|log| log.path == "/" || log.path == "/script.js")
+        {
+            assert_eq!(log.x_client.as_deref(), Some("stealth"));
+        }
+
+        let document_event = page
+            .network_events
+            .iter()
+            .find(|event| event.resource_type == "Document")
+            .unwrap();
+        assert_eq!(document_event.status, 200);
+        assert!(document_event.body_size > 0);
+
+        let script_event = page
+            .network_events
+            .iter()
+            .find(|event| event.resource_type == "Script" && event.url.ends_with("/script.js"))
+            .unwrap();
+        assert_eq!(script_event.status, 200);
+        assert!(script_event.body_size > 0);
+        assert_eq!(
+            script_event
+                .response_headers
+                .get("content-type")
+                .map(String::as_str),
+            Some("application/javascript")
+        );
+    }
+
+    #[tokio::test]
+    async fn subresource_helper_uses_stealth_client_when_enabled() {
+        let (base_url, request_logs) = spawn_test_server().await;
+        let context = Arc::new(BrowserContext::with_options(
+            "ctx-stealth-helper".to_string(),
+            None,
+            true,
+        ));
+        let page = Page::new("page-stealth-helper".to_string(), context.clone());
+
+        let mut normal_headers = HashMap::new();
+        normal_headers.insert("x-client".to_string(), "http".to_string());
+        context.http_client.set_extra_headers(normal_headers).await;
+
+        let mut stealth_headers = HashMap::new();
+        stealth_headers.insert("x-client".to_string(), "stealth".to_string());
+        page.stealth_client
+            .as_ref()
+            .unwrap()
+            .set_extra_headers(stealth_headers)
+            .await;
+
+        let url = Url::parse(&format!("{}/script.js", base_url)).unwrap();
+        let response = page.do_subresource_fetch(&url).await.unwrap();
+        assert_eq!(response.status, 200);
+
+        let logs = request_logs.lock().await.clone();
+        let script_log = logs.iter().find(|log| log.path == "/script.js").unwrap();
+        assert_eq!(script_log.x_client.as_deref(), Some("stealth"));
     }
 }
