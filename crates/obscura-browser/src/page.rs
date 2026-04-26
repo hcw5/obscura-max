@@ -113,6 +113,28 @@ impl Page {
         }
         self.http_client.fetch(url).await
     }
+
+    async fn do_subresource_fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
+        Self::do_subresource_fetch_with_clients(
+            self.http_client.clone(),
+            #[cfg(feature = "stealth")]
+            self.stealth_client.clone(),
+            url,
+        )
+        .await
+    }
+
+    async fn do_subresource_fetch_with_clients(
+        http_client: Arc<ObscuraHttpClient>,
+        #[cfg(feature = "stealth")] stealth_client: Option<Arc<StealthHttpClient>>,
+        url: &Url,
+    ) -> Result<Response, ObscuraNetError> {
+        #[cfg(feature = "stealth")]
+        if let Some(stealth) = stealth_client {
+            return stealth.fetch(url).await;
+        }
+        http_client.fetch(url).await
+    }
     fn init_js(&mut self) {
         if self.js.is_some() {
             let url_str = self.url_string();
@@ -1114,5 +1136,176 @@ pub enum PageError {
 impl From<ObscuraNetError> for PageError {
     fn from(e: ObscuraNetError) -> Self {
         PageError::NetworkError(e.to_string())
+    }
+}
+
+#[cfg(all(test, feature = "stealth"))]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    use crate::context::BrowserContext;
+
+    use super::Page;
+
+    #[derive(Debug, Clone)]
+    struct RequestLog {
+        path: String,
+        x_client: Option<String>,
+    }
+
+    async fn spawn_test_server() -> (String, Arc<tokio::sync::Mutex<Vec<RequestLog>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{}", addr);
+        let logs: Arc<tokio::sync::Mutex<Vec<RequestLog>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let logs_for_task = logs.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let accepted = tokio::time::timeout(
+                    tokio::time::Duration::from_millis(800),
+                    listener.accept(),
+                )
+                .await;
+                let (mut socket, _) = match accepted {
+                    Ok(Ok(pair)) => pair,
+                    _ => break,
+                };
+                let mut buf = vec![0u8; 4096];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                let mut lines = request.lines();
+                let request_line = lines.next().unwrap_or_default();
+                let path = request_line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("/")
+                    .to_string();
+                let x_client = request
+                    .lines()
+                    .find_map(|line| line.strip_prefix("x-client:").map(str::trim))
+                    .map(ToString::to_string);
+
+                logs_for_task.lock().await.push(RequestLog {
+                    path: path.clone(),
+                    x_client,
+                });
+
+                let (content_type, body) = if path == "/script.js" {
+                    (
+                        "application/javascript",
+                        "window.__obscura_script_loaded = true;",
+                    )
+                } else {
+                    (
+                        "text/html",
+                        "<!doctype html><html><head><script src=\"/script.js\"></script></head><body>ok</body></html>",
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    content_type,
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+
+        (base_url, logs)
+    }
+
+    #[tokio::test]
+    async fn stealth_uses_stealth_client_for_document_and_script_fetches() {
+        let (base_url, request_logs) = spawn_test_server().await;
+        let context = Arc::new(BrowserContext::with_options(
+            "ctx-stealth".to_string(),
+            None,
+            true,
+        ));
+        let mut page = Page::new("page-stealth".to_string(), context.clone());
+
+        let mut normal_headers = HashMap::new();
+        normal_headers.insert("x-client".to_string(), "http".to_string());
+        context.http_client.set_extra_headers(normal_headers).await;
+
+        let mut stealth_headers = HashMap::new();
+        stealth_headers.insert("x-client".to_string(), "stealth".to_string());
+        page.stealth_client
+            .as_ref()
+            .unwrap()
+            .set_extra_headers(stealth_headers)
+            .await;
+
+        page.navigate(&format!("{}/", base_url)).await.unwrap();
+
+        let logs = request_logs.lock().await.clone();
+        assert!(logs.iter().any(|log| log.path == "/"));
+        assert!(logs.iter().any(|log| log.path == "/script.js"));
+        for log in logs
+            .iter()
+            .filter(|log| log.path == "/" || log.path == "/script.js")
+        {
+            assert_eq!(log.x_client.as_deref(), Some("stealth"));
+        }
+
+        let document_event = page
+            .network_events
+            .iter()
+            .find(|event| event.resource_type == "Document")
+            .unwrap();
+        assert_eq!(document_event.status, 200);
+        assert!(document_event.body_size > 0);
+
+        let script_event = page
+            .network_events
+            .iter()
+            .find(|event| event.resource_type == "Script" && event.url.ends_with("/script.js"))
+            .unwrap();
+        assert_eq!(script_event.status, 200);
+        assert!(script_event.body_size > 0);
+        assert_eq!(
+            script_event
+                .response_headers
+                .get("content-type")
+                .map(String::as_str),
+            Some("application/javascript")
+        );
+    }
+
+    #[tokio::test]
+    async fn subresource_helper_uses_stealth_client_when_enabled() {
+        let (base_url, request_logs) = spawn_test_server().await;
+        let context = Arc::new(BrowserContext::with_options(
+            "ctx-stealth-helper".to_string(),
+            None,
+            true,
+        ));
+        let page = Page::new("page-stealth-helper".to_string(), context.clone());
+
+        let mut normal_headers = HashMap::new();
+        normal_headers.insert("x-client".to_string(), "http".to_string());
+        context.http_client.set_extra_headers(normal_headers).await;
+
+        let mut stealth_headers = HashMap::new();
+        stealth_headers.insert("x-client".to_string(), "stealth".to_string());
+        page.stealth_client
+            .as_ref()
+            .unwrap()
+            .set_extra_headers(stealth_headers)
+            .await;
+
+        let url = Url::parse(&format!("{}/script.js", base_url)).unwrap();
+        let response = page.do_subresource_fetch(&url).await.unwrap();
+        assert_eq!(response.status, 200);
+
+        let logs = request_logs.lock().await.clone();
+        let script_log = logs.iter().find(|log| log.path == "/script.js").unwrap();
+        assert_eq!(script_log.x_client.as_deref(), Some("stealth"));
     }
 }

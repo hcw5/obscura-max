@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use obscura_net::{CookieJar, ObscuraHttpClient, RobotsCache};
+use obscura_net::{BlocklistConfig, CookieJar, ObscuraHttpClient, RobotsCache};
 
 pub struct BrowserContext {
     pub id: String,
@@ -11,6 +11,7 @@ pub struct BrowserContext {
     pub robots_cache: Arc<RobotsCache>,
     pub obey_robots: bool,
     pub stealth: bool,
+    pub tracker_blocklist_config: BlocklistConfig,
 }
 
 impl BrowserContext {
@@ -26,18 +27,26 @@ impl BrowserContext {
             robots_cache: Arc::new(RobotsCache::new()),
             obey_robots: false,
             stealth: false,
+            tracker_blocklist_config: BlocklistConfig::default(),
         }
     }
 
     pub fn with_options(id: String, proxy_url: Option<String>, stealth: bool) -> Self {
+        Self::with_options_and_blocklist(id, proxy_url, stealth, None)
+    }
+
+    pub fn with_options_and_blocklist(
+        id: String,
+        proxy_url: Option<String>,
+        stealth: bool,
+        tracker_blocklist_config: Option<BlocklistConfig>,
+    ) -> Self {
         let cookie_jar = Arc::new(CookieJar::new());
-        let mut client = ObscuraHttpClient::with_options(
-            cookie_jar.clone(),
-            proxy_url.as_deref(),
-        );
-        if stealth {
-            client.block_trackers = true;
-        }
+        let mut client = ObscuraHttpClient::with_options(cookie_jar.clone(), proxy_url.as_deref());
+        client.block_trackers = stealth;
+        let tracker_blocklist_config = tracker_blocklist_config.unwrap_or_default();
+        client.tracker_blocklist_config = tracker_blocklist_config;
+
         let http_client = Arc::new(client);
         BrowserContext {
             id,
@@ -48,6 +57,7 @@ impl BrowserContext {
             robots_cache: Arc::new(RobotsCache::new()),
             obey_robots: false,
             stealth,
+            tracker_blocklist_config,
         }
     }
 

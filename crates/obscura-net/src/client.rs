@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,6 +8,7 @@ use reqwest::{Client, Method};
 use tokio::sync::RwLock;
 use url::Url;
 
+use crate::blocklist::BlocklistConfig;
 use crate::cookies::CookieJar;
 use crate::interceptor::{InterceptAction, RequestInterceptor};
 
@@ -63,6 +63,66 @@ pub enum ResourceType {
 
 pub type RequestCallback = Arc<dyn Fn(&RequestInfo) + Send + Sync>;
 pub type ResponseCallback = Arc<dyn Fn(&RequestInfo, &Response) + Send + Sync>;
+
+fn infer_resource_type(url: &Url) -> ResourceType {
+    let path = url.path().to_ascii_lowercase();
+    if path.ends_with(".js") || path.ends_with(".mjs") {
+        return ResourceType::Script;
+    }
+    if path.ends_with(".css") {
+        return ResourceType::Stylesheet;
+    }
+    if path.ends_with(".png")
+        || path.ends_with(".jpg")
+        || path.ends_with(".jpeg")
+        || path.ends_with(".gif")
+        || path.ends_with(".svg")
+        || path.ends_with(".webp")
+        || path.ends_with(".ico")
+    {
+        return ResourceType::Image;
+    }
+    if path.ends_with(".woff")
+        || path.ends_with(".woff2")
+        || path.ends_with(".ttf")
+        || path.ends_with(".otf")
+        || path.ends_with(".eot")
+    {
+        return ResourceType::Font;
+    }
+    if path.ends_with(".json") {
+        return ResourceType::Fetch;
+    }
+    if path.ends_with(".html") || path.ends_with(".htm") {
+        return ResourceType::Document;
+    }
+    ResourceType::Other
+}
+
+fn synthetic_blocked_response(url: &Url) -> Response {
+    let resource_type = infer_resource_type(url);
+    let (content_type, body) = match resource_type {
+        ResourceType::Document => ("text/html; charset=utf-8", b"<!doctype html>".to_vec()),
+        ResourceType::Script => ("application/javascript; charset=utf-8", Vec::new()),
+        ResourceType::Stylesheet => ("text/css; charset=utf-8", Vec::new()),
+        ResourceType::Image => ("image/gif", Vec::new()),
+        ResourceType::Font => ("font/woff2", Vec::new()),
+        ResourceType::Fetch | ResourceType::Xhr => ("application/json; charset=utf-8", b"{}".to_vec()),
+        ResourceType::Other => ("text/plain; charset=utf-8", Vec::new()),
+    };
+
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), content_type.to_string());
+    headers.insert("cache-control".to_string(), "no-store".to_string());
+
+    Response {
+        status: 200,
+        url: url.clone(),
+        headers,
+        body,
+        redirected_from: Vec::new(),
+    }
+}
 
 fn validate_url(url: &Url) -> Result<(), ObscuraNetError> {
     let scheme = url.scheme();
@@ -166,6 +226,7 @@ pub struct ObscuraHttpClient {
     pub timeout: Duration,
     pub in_flight: Arc<std::sync::atomic::AtomicU32>,
     pub block_trackers: bool,
+    pub tracker_blocklist_config: BlocklistConfig,
 }
 
 impl ObscuraHttpClient {
@@ -192,25 +253,27 @@ impl ObscuraHttpClient {
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             timeout: Duration::from_secs(30),
             block_trackers: false,
+            tracker_blocklist_config: BlocklistConfig::default(),
         }
     }
 
     async fn get_client(&self) -> &Client {
-        self.client.get_or_init(|| async {
-            let mut builder = Client::builder()
-                .redirect(Policy::none())
-                .timeout(Duration::from_secs(30))
-                .danger_accept_invalid_certs(false)
-;
+        self.client
+            .get_or_init(|| async {
+                let mut builder = Client::builder()
+                    .redirect(Policy::none())
+                    .timeout(Duration::from_secs(30))
+                    .danger_accept_invalid_certs(false);
 
-            if let Some(ref proxy) = self.proxy_url {
-                if let Ok(p) = reqwest::Proxy::all(proxy.as_str()) {
-                    builder = builder.proxy(p);
+                if let Some(ref proxy) = self.proxy_url {
+                    if let Ok(p) = reqwest::Proxy::all(proxy.as_str()) {
+                        builder = builder.proxy(p);
+                    }
                 }
-            }
 
-            builder.build().expect("failed to build HTTP client")
-        }).await
+                builder.build().expect("failed to build HTTP client")
+            })
+            .await
     }
 
     pub async fn fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
@@ -218,7 +281,8 @@ impl ObscuraHttpClient {
     }
 
     pub async fn post_form(&self, url: &Url, body: &str) -> Result<Response, ObscuraNetError> {
-        self.fetch_with_method(Method::POST, url, Some(body.as_bytes().to_vec())).await
+        self.fetch_with_method(Method::POST, url, Some(body.as_bytes().to_vec()))
+            .await
     }
 
     pub async fn fetch_with_method(
@@ -237,15 +301,9 @@ impl ObscuraHttpClient {
         let mut body = initial_body;
         if self.block_trackers {
             if let Some(host) = url.host_str() {
-                if crate::blocklist::is_blocked(host) {
+                if crate::blocklist::is_blocked_with_config(host, &self.tracker_blocklist_config) {
                     tracing::debug!("Blocked tracker: {}", url);
-                    return Ok(Response {
-                        status: 0,
-                        url: url.clone(),
-                        headers: HashMap::new(),
-                        body: Vec::new(),
-                        redirected_from: Vec::new(),
-                    });
+                    return Ok(synthetic_blocked_response(url));
                 }
             }
         }
@@ -297,7 +355,9 @@ impl ObscuraHttpClient {
             );
             headers.insert(
                 HeaderName::from_static("sec-ch-ua"),
-                HeaderValue::from_static("\"Chromium\";v=\"145\", \"Not;A=Brand\";v=\"24\", \"Google Chrome\";v=\"145\""),
+                HeaderValue::from_static(
+                    "\"Chromium\";v=\"145\", \"Not;A=Brand\";v=\"24\", \"Google Chrome\";v=\"145\"",
+                ),
             );
             headers.insert(
                 HeaderName::from_static("sec-ch-ua-mobile"),
@@ -344,7 +404,10 @@ impl ObscuraHttpClient {
                 }
             }
 
-            let mut req_builder = self.get_client().await.request(method.clone(), current_url.as_str())
+            let mut req_builder = self
+                .get_client()
+                .await
+                .request(method.clone(), current_url.as_str())
                 .headers(headers);
 
             if let Some(ref b) = body {
@@ -357,12 +420,15 @@ impl ObscuraHttpClient {
                 req_builder = req_builder.body(b.clone());
             }
 
-            self.in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.in_flight
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let resp = req_builder.send().await.map_err(|e| {
-                self.in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                self.in_flight
+                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 ObscuraNetError::Network(format!("{}: {}", current_url, e))
             })?;
-            self.in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            self.in_flight
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
 
             let status = resp.status();
 
@@ -375,7 +441,12 @@ impl ObscuraHttpClient {
             let response_headers: HashMap<String, String> = resp
                 .headers()
                 .iter()
-                .map(|(k, v)| (k.as_str().to_lowercase(), v.to_str().unwrap_or("").to_string()))
+                .map(|(k, v)| {
+                    (
+                        k.as_str().to_lowercase(),
+                        v.to_str().unwrap_or("").to_string(),
+                    )
+                })
                 .collect();
 
             if status.is_redirection() {
@@ -400,9 +471,11 @@ impl ObscuraHttpClient {
                 }
             }
 
-            let body_bytes = resp.bytes().await.map_err(|e| {
-                ObscuraNetError::Network(format!("Failed to read body: {}", e))
-            })?.to_vec();
+            let body_bytes = resp
+                .bytes()
+                .await
+                .map_err(|e| ObscuraNetError::Network(format!("Failed to read body: {}", e)))?
+                .to_vec();
 
             let response = Response {
                 url: current_url,
@@ -442,6 +515,46 @@ impl ObscuraHttpClient {
 impl Default for ObscuraHttpClient {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn blocked_tracker_script_gets_synthetic_success_response() {
+        let mut client = ObscuraHttpClient::new();
+        client.block_trackers = true;
+
+        let url = Url::parse("https://www.google-analytics.com/ga.js").unwrap();
+        let response = client.fetch(&url).await.unwrap();
+
+        assert_eq!(response.status, 200);
+        assert_ne!(response.status, 0);
+        assert_eq!(
+            response.header("content-type"),
+            Some("application/javascript; charset=utf-8")
+        );
+        assert_eq!(response.header("cache-control"), Some("no-store"));
+        assert!(response.body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn blocked_tracker_json_gets_minimal_json_body() {
+        let mut client = ObscuraHttpClient::new();
+        client.block_trackers = true;
+
+        let url = Url::parse("https://doubleclick.net/events/config.json").unwrap();
+        let response = client.fetch(&url).await.unwrap();
+
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            response.header("content-type"),
+            Some("application/json; charset=utf-8")
+        );
+        assert_eq!(response.header("cache-control"), Some("no-store"));
+        assert_eq!(response.body, b"{}");
     }
 }
 
