@@ -874,6 +874,28 @@ mod tests {
     }
 
     #[test]
+    fn test_inner_text_skips_display_none() {
+        let mut rt = setup_runtime(r#"<div id="root">Visible <span id="hidden">gone</span><span>text</span></div>"#);
+        rt.evaluate("document.getElementById('hidden').style.display = 'none'").unwrap();
+        let text = rt.evaluate("document.getElementById('root').innerText").unwrap();
+        assert_eq!(text, serde_json::json!("Visible text"));
+    }
+
+    #[test]
+    fn test_inner_text_respects_nested_block_boundaries() {
+        let mut rt = setup_runtime(r#"<div id="root"><div>First <span>line</span></div><div>Second</div></div>"#);
+        let text = rt.evaluate("document.getElementById('root').innerText").unwrap();
+        assert_eq!(text, serde_json::json!("First line\nSecond"));
+    }
+
+    #[test]
+    fn test_inner_text_normalizes_whitespace() {
+        let mut rt = setup_runtime(r#"<div id="root">  Alpha   <span>  Beta </span>  <span>Gamma</span> </div>"#);
+        let text = rt.evaluate("document.getElementById('root').innerText").unwrap();
+        assert_eq!(text, serde_json::json!("Alpha Beta Gamma"));
+    }
+
+    #[test]
     fn test_get_element_by_id() {
         let mut rt = setup_runtime(r#"<div id="test">Content</div>"#);
         let tag = rt
