@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -63,6 +62,41 @@ pub enum ResourceType {
 
 pub type RequestCallback = Arc<dyn Fn(&RequestInfo) + Send + Sync>;
 pub type ResponseCallback = Arc<dyn Fn(&RequestInfo, &Response) + Send + Sync>;
+
+fn non_fingerprintable_base_headers(ua: &str) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(USER_AGENT, HeaderValue::from_str(ua).unwrap_or_else(|_| {
+        HeaderValue::from_static(
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+        )
+    }));
+    // This reqwest path is intentionally non-browser-fingerprinted.
+    // Browser-fidelity traffic must use the StealthHttpClient (wreq).
+    headers.insert(reqwest::header::ACCEPT, HeaderValue::from_static("*/*"));
+    headers.insert(
+        HeaderName::from_static("x-obscura-client-profile"),
+        HeaderValue::from_static("non-fingerprintable"),
+    );
+    headers
+}
+
+#[cfg(test)]
+mod tests {
+    use super::non_fingerprintable_base_headers;
+
+    #[test]
+    fn non_fingerprintable_profile_headers_are_stable() {
+        let headers = non_fingerprintable_base_headers("test-ua");
+        assert_eq!(
+            headers
+                .get("x-obscura-client-profile")
+                .and_then(|v| v.to_str().ok()),
+            Some("non-fingerprintable")
+        );
+        assert!(headers.get("sec-ch-ua").is_none());
+        assert!(headers.get("sec-fetch-mode").is_none());
+    }
+}
 
 fn validate_url(url: &Url) -> Result<(), ObscuraNetError> {
     let scheme = url.scheme();
@@ -196,21 +230,22 @@ impl ObscuraHttpClient {
     }
 
     async fn get_client(&self) -> &Client {
-        self.client.get_or_init(|| async {
-            let mut builder = Client::builder()
-                .redirect(Policy::none())
-                .timeout(Duration::from_secs(30))
-                .danger_accept_invalid_certs(false)
-;
+        self.client
+            .get_or_init(|| async {
+                let mut builder = Client::builder()
+                    .redirect(Policy::none())
+                    .timeout(Duration::from_secs(30))
+                    .danger_accept_invalid_certs(false);
 
-            if let Some(ref proxy) = self.proxy_url {
-                if let Ok(p) = reqwest::Proxy::all(proxy.as_str()) {
-                    builder = builder.proxy(p);
+                if let Some(ref proxy) = self.proxy_url {
+                    if let Ok(p) = reqwest::Proxy::all(proxy.as_str()) {
+                        builder = builder.proxy(p);
+                    }
                 }
-            }
 
-            builder.build().expect("failed to build HTTP client")
-        }).await
+                builder.build().expect("failed to build HTTP client")
+            })
+            .await
     }
 
     pub async fn fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
@@ -218,7 +253,8 @@ impl ObscuraHttpClient {
     }
 
     pub async fn post_form(&self, url: &Url, body: &str) -> Result<Response, ObscuraNetError> {
-        self.fetch_with_method(Method::POST, url, Some(body.as_bytes().to_vec())).await
+        self.fetch_with_method(Method::POST, url, Some(body.as_bytes().to_vec()))
+            .await
     }
 
     pub async fn fetch_with_method(
@@ -283,50 +319,7 @@ impl ObscuraHttpClient {
             }
 
             let ua = self.user_agent.read().await.clone();
-            let mut headers = HeaderMap::new();
-            headers.insert(USER_AGENT, HeaderValue::from_str(&ua).unwrap_or_else(|_| {
-                HeaderValue::from_static("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36")
-            }));
-            headers.insert(
-                reqwest::header::ACCEPT,
-                HeaderValue::from_static("text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"),
-            );
-            headers.insert(
-                reqwest::header::ACCEPT_LANGUAGE,
-                HeaderValue::from_static("en-US,en;q=0.9"),
-            );
-            headers.insert(
-                HeaderName::from_static("sec-ch-ua"),
-                HeaderValue::from_static("\"Chromium\";v=\"145\", \"Not;A=Brand\";v=\"24\", \"Google Chrome\";v=\"145\""),
-            );
-            headers.insert(
-                HeaderName::from_static("sec-ch-ua-mobile"),
-                HeaderValue::from_static("?0"),
-            );
-            headers.insert(
-                HeaderName::from_static("sec-ch-ua-platform"),
-                HeaderValue::from_static("\"Linux\""),
-            );
-            headers.insert(
-                HeaderName::from_static("sec-fetch-dest"),
-                HeaderValue::from_static("document"),
-            );
-            headers.insert(
-                HeaderName::from_static("sec-fetch-mode"),
-                HeaderValue::from_static("navigate"),
-            );
-            headers.insert(
-                HeaderName::from_static("sec-fetch-site"),
-                HeaderValue::from_static("none"),
-            );
-            headers.insert(
-                HeaderName::from_static("sec-fetch-user"),
-                HeaderValue::from_static("?1"),
-            );
-            headers.insert(
-                HeaderName::from_static("upgrade-insecure-requests"),
-                HeaderValue::from_static("1"),
-            );
+            let mut headers = non_fingerprintable_base_headers(&ua);
 
             let cookie_header = self.cookie_jar.get_cookie_header(&current_url);
             if !cookie_header.is_empty() {
@@ -344,7 +337,10 @@ impl ObscuraHttpClient {
                 }
             }
 
-            let mut req_builder = self.get_client().await.request(method.clone(), current_url.as_str())
+            let mut req_builder = self
+                .get_client()
+                .await
+                .request(method.clone(), current_url.as_str())
                 .headers(headers);
 
             if let Some(ref b) = body {
@@ -357,12 +353,15 @@ impl ObscuraHttpClient {
                 req_builder = req_builder.body(b.clone());
             }
 
-            self.in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.in_flight
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let resp = req_builder.send().await.map_err(|e| {
-                self.in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                self.in_flight
+                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 ObscuraNetError::Network(format!("{}: {}", current_url, e))
             })?;
-            self.in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            self.in_flight
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
 
             let status = resp.status();
 
@@ -375,7 +374,12 @@ impl ObscuraHttpClient {
             let response_headers: HashMap<String, String> = resp
                 .headers()
                 .iter()
-                .map(|(k, v)| (k.as_str().to_lowercase(), v.to_str().unwrap_or("").to_string()))
+                .map(|(k, v)| {
+                    (
+                        k.as_str().to_lowercase(),
+                        v.to_str().unwrap_or("").to_string(),
+                    )
+                })
                 .collect();
 
             if status.is_redirection() {
@@ -400,9 +404,11 @@ impl ObscuraHttpClient {
                 }
             }
 
-            let body_bytes = resp.bytes().await.map_err(|e| {
-                ObscuraNetError::Network(format!("Failed to read body: {}", e))
-            })?.to_vec();
+            let body_bytes = resp
+                .bytes()
+                .await
+                .map_err(|e| ObscuraNetError::Network(format!("Failed to read body: {}", e)))?
+                .to_vec();
 
             let response = Response {
                 url: current_url,
