@@ -1,0 +1,58 @@
+{
+  "id": "chrome_linux_en_gb",
+  "locale": "en-GB",
+  "timezone": "Europe/London",
+  "accept_language": "en-GB,en;q=0.9",
+  "languages": ["en-GB", "en"],
+  "platform": "Linux x86_64",
+  "hardware_class": "mid",
+  "user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+  "screen": {
+    "width": 1920,
+    "height": 1200,
+    "avail_width": 1920,
+    "avail_height": 1160,
+    "color_depth": 24,
+    "pixel_depth": 24,
+    "device_pixel_ratio": 1.0
+  },
+  "window": {
+    "inner_width": 1366,
+    "inner_height": 768,
+    "outer_width": 1366,
+    "outer_height": 840
+  },
+  "ua_data": {
+    "brands": [
+      {"brand": "Chromium", "version": "145"},
+      {"brand": "Google Chrome", "version": "145"}
+    ],
+    "mobile": false,
+    "platform": "Linux",
+    "platform_version": "6.8.0",
+    "architecture": "x86",
+    "model": ""
+  },
+  "webgl": {
+    "vendor": "Google Inc. (Intel)",
+    "renderer": "ANGLE (Intel, Mesa Intel(R) Xe Graphics (TGL GT2), OpenGL 4.6)"
+  },
+  "battery": {
+    "charging": true,
+    "charging_time": 0,
+    "discharging_time": 0,
+    "level": 0.98
+  },
+  "tls": {
+    "min_version": "TLS1.2",
+    "max_version": "TLS1.3",
+    "ciphers": ["TLS_AES_128_GCM_SHA256", "TLS_AES_256_GCM_SHA384"],
+    "signature_algorithms": ["rsa_pss_rsae_sha256", "ecdsa_secp256r1_sha256"]
+  },
+  "plugins": [
+    {"name": "Chrome PDF Viewer", "filename": "internal-pdf-viewer", "description": "Portable Document Format"}
+  ],
+  "mime_types": [
+    {"type": "application/pdf", "suffixes": "pdf", "description": "Portable Document Format", "enabled_plugin": "Chrome PDF Viewer"}
+  ]
+}
