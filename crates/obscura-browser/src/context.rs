@@ -131,6 +131,18 @@ impl BrowserContext {
         }
     }
 
+    pub fn with_profile(
+        id: String,
+        profile_id: &str,
+        proxy_url: Option<String>,
+        stealth: bool,
+    ) -> Self {
+        let profile = load_profile_by_id(profile_id);
+        let mut context = Self::with_options(id, proxy_url, stealth);
+        context.user_agent = profile.user_agent;
+        context
+    }
+
     pub fn with_proxy(id: String, proxy_url: Option<String>) -> Self {
         Self::with_options(id, proxy_url, false)
     }

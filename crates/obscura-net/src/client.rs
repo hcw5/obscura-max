@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,6 +11,147 @@ use url::Url;
 use crate::blocklist::BlocklistConfig;
 use crate::cookies::CookieJar;
 use crate::interceptor::{InterceptAction, RequestInterceptor};
+
+const REQUIRED_HTTP2_WINDOW_UPDATE_INCREMENT: u32 = 15_663_105;
+const REQUIRED_HTTP2_SETTINGS_ORDER: [&str; 5] = [
+    "HEADER_TABLE_SIZE",
+    "ENABLE_PUSH",
+    "MAX_CONCURRENT_STREAMS",
+    "INITIAL_WINDOW_SIZE",
+    "MAX_HEADER_LIST_SIZE",
+];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsFingerprintParams {
+    pub cipher_suite_order: Vec<String>,
+    pub extension_order: Vec<String>,
+    pub grease_injection_positions: Vec<usize>,
+    pub supported_groups_order: Vec<String>,
+    pub expected_ja3_hash: Option<String>,
+    pub expected_ja4_hash: Option<String>,
+}
+
+impl TlsFingerprintParams {
+    fn validate(&self) -> Result<(), ObscuraNetError> {
+        if self.cipher_suite_order.is_empty() {
+            return Err(ObscuraNetError::FingerprintConfig(
+                "TLS fingerprint must include cipher suite ordering".to_string(),
+            ));
+        }
+        if self.extension_order.is_empty() {
+            return Err(ObscuraNetError::FingerprintConfig(
+                "TLS fingerprint must include extension ordering".to_string(),
+            ));
+        }
+        if self.supported_groups_order.is_empty() {
+            return Err(ObscuraNetError::FingerprintConfig(
+                "TLS fingerprint must include supported group ordering".to_string(),
+            ));
+        }
+        for &pos in &self.grease_injection_positions {
+            if pos > self.extension_order.len() {
+                return Err(ObscuraNetError::FingerprintConfig(format!(
+                    "GREASE insertion index {} is outside extension order length {}",
+                    pos,
+                    self.extension_order.len()
+                )));
+            }
+        }
+        for (label, hash) in [
+            ("JA3", self.expected_ja3_hash.as_deref()),
+            ("JA4", self.expected_ja4_hash.as_deref()),
+        ] {
+            if let Some(value) = hash {
+                if value.trim().is_empty() {
+                    return Err(ObscuraNetError::FingerprintConfig(format!(
+                        "{label} expected hash cannot be empty"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Http2FingerprintConfig {
+    pub settings_in_order: Vec<(String, u32)>,
+    pub window_update_increment: u32,
+}
+
+impl Http2FingerprintConfig {
+    pub fn chrome_like_default() -> Self {
+        Self {
+            settings_in_order: vec![
+                ("HEADER_TABLE_SIZE".to_string(), 65_536),
+                ("ENABLE_PUSH".to_string(), 0),
+                ("MAX_CONCURRENT_STREAMS".to_string(), 1_000),
+                ("INITIAL_WINDOW_SIZE".to_string(), 6_291_456),
+                ("MAX_HEADER_LIST_SIZE".to_string(), 262_144),
+            ],
+            window_update_increment: REQUIRED_HTTP2_WINDOW_UPDATE_INCREMENT,
+        }
+    }
+
+    fn validate_preface_behavior(&self) -> Result<(), ObscuraNetError> {
+        let setting_names: Vec<&str> = self
+            .settings_in_order
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
+        if setting_names != REQUIRED_HTTP2_SETTINGS_ORDER {
+            return Err(ObscuraNetError::FingerprintConfig(format!(
+                "HTTP/2 SETTINGS order must be {:?}, got {:?}",
+                REQUIRED_HTTP2_SETTINGS_ORDER, setting_names
+            )));
+        }
+        if self.window_update_increment != REQUIRED_HTTP2_WINDOW_UPDATE_INCREMENT {
+            return Err(ObscuraNetError::FingerprintConfig(format!(
+                "HTTP/2 WINDOW_UPDATE increment must be {}",
+                REQUIRED_HTTP2_WINDOW_UPDATE_INCREMENT
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserHeaderProfile {
+    pub sec_ch_ua: String,
+    pub sec_ch_ua_platform: String,
+    pub accept_language: String,
+}
+
+impl BrowserHeaderProfile {
+    fn ordered_pairs(&self) -> [(&'static str, &str); 3] {
+        [
+            ("sec-ch-ua", self.sec_ch_ua.as_str()),
+            ("sec-ch-ua-platform", self.sec_ch_ua_platform.as_str()),
+            ("accept-language", self.accept_language.as_str()),
+        ]
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FingerprintedTransportConfig {
+    pub tls: TlsFingerprintParams,
+    pub http2: Http2FingerprintConfig,
+    pub headers: BrowserHeaderProfile,
+}
+
+impl FingerprintedTransportConfig {
+    fn validate(&self) -> Result<(), ObscuraNetError> {
+        self.tls.validate()?;
+        self.http2.validate_preface_behavior()?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransportMode {
+    NonFingerprintable,
+    Fingerprinted(FingerprintedTransportConfig),
+}
 
 #[derive(Debug, Clone)]
 pub struct Response {
@@ -64,6 +205,71 @@ pub enum ResourceType {
 pub type RequestCallback = Arc<dyn Fn(&RequestInfo) + Send + Sync>;
 pub type ResponseCallback = Arc<dyn Fn(&RequestInfo, &Response) + Send + Sync>;
 
+fn infer_resource_type_from_url(url: &Url) -> ResourceType {
+    let path = url.path().to_ascii_lowercase();
+    if path.ends_with(".js") || path.ends_with(".mjs") {
+        return ResourceType::Script;
+    }
+    if path.ends_with(".css") {
+        return ResourceType::Stylesheet;
+    }
+    if path.ends_with(".json") {
+        return ResourceType::Fetch;
+    }
+    if [".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg", ".ico"]
+        .iter()
+        .any(|ext| path.ends_with(ext))
+    {
+        return ResourceType::Image;
+    }
+    if [".woff", ".woff2", ".ttf", ".otf"]
+        .iter()
+        .any(|ext| path.ends_with(ext))
+    {
+        return ResourceType::Font;
+    }
+    ResourceType::Document
+}
+
+fn synthetic_blocked_response(url: &Url) -> Response {
+    let resource_type = infer_resource_type_from_url(url);
+    let (content_type, body) = match resource_type {
+        ResourceType::Script => ("application/javascript; charset=utf-8", Vec::new()),
+        ResourceType::Stylesheet => ("text/css; charset=utf-8", Vec::new()),
+        ResourceType::Image => (
+            "image/gif",
+            // 1x1 transparent GIF
+            vec![
+                0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x80, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0xff, 0xff, 0xff, 0x21, 0xf9, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00, 0x2c,
+                0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x02, 0x44, 0x01, 0x00,
+                0x3b,
+            ],
+        ),
+        ResourceType::Font => ("font/woff2", Vec::new()),
+        ResourceType::Xhr | ResourceType::Fetch => {
+            ("application/json; charset=utf-8", b"{}".to_vec())
+        }
+        ResourceType::Document | ResourceType::Other => (
+            "text/html; charset=utf-8",
+            b"<!doctype html><html><head></head><body></body></html>".to_vec(),
+        ),
+    };
+
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), content_type.to_string());
+    headers.insert("cache-control".to_string(), "no-store".to_string());
+    headers.insert("content-length".to_string(), body.len().to_string());
+
+    Response {
+        url: url.clone(),
+        status: 200,
+        headers,
+        body,
+        redirected_from: Vec::new(),
+    }
+}
+
 fn non_fingerprintable_base_headers(ua: &str) -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert(USER_AGENT, HeaderValue::from_str(ua).unwrap_or_else(|_| {
@@ -82,8 +288,8 @@ fn non_fingerprintable_base_headers(ua: &str) -> HeaderMap {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::non_fingerprintable_base_headers;
+mod header_tests {
+    use super::*;
 
     #[test]
     fn non_fingerprintable_profile_headers_are_stable() {
@@ -96,6 +302,53 @@ mod tests {
         );
         assert!(headers.get("sec-ch-ua").is_none());
         assert!(headers.get("sec-fetch-mode").is_none());
+    }
+
+    #[test]
+    fn http2_preface_validation_requires_expected_window_update() {
+        let mut http2 = Http2FingerprintConfig::chrome_like_default();
+        http2.window_update_increment = 1;
+        assert!(http2.validate_preface_behavior().is_err());
+    }
+
+    #[tokio::test]
+    async fn fingerprinted_mode_emits_profile_headers_in_browser_order() {
+        let client = ObscuraHttpClient::new();
+        let tls = TlsFingerprintParams {
+            cipher_suite_order: vec!["TLS_AES_128_GCM_SHA256".to_string()],
+            extension_order: vec!["server_name".to_string(), "supported_groups".to_string()],
+            grease_injection_positions: vec![0],
+            supported_groups_order: vec!["X25519".to_string()],
+            expected_ja3_hash: Some("abc123".to_string()),
+            expected_ja4_hash: Some("def456".to_string()),
+        };
+        let config = FingerprintedTransportConfig {
+            tls,
+            http2: Http2FingerprintConfig::chrome_like_default(),
+            headers: BrowserHeaderProfile {
+                sec_ch_ua: "\"Chromium\";v=\"145\"".to_string(),
+                sec_ch_ua_platform: "\"Linux\"".to_string(),
+                accept_language: "en-US,en;q=0.9".to_string(),
+            },
+        };
+        client
+            .set_transport_mode(TransportMode::Fingerprinted(config.clone()))
+            .await
+            .unwrap();
+
+        let headers = client
+            .base_headers_for_mode("test-agent", &TransportMode::Fingerprinted(config))
+            .unwrap();
+        let mut observed = Vec::new();
+        for (name, _) in headers.iter() {
+            if name == "sec-ch-ua" || name == "sec-ch-ua-platform" || name == "accept-language" {
+                observed.push(name.as_str().to_string());
+            }
+        }
+        assert_eq!(
+            observed,
+            vec!["sec-ch-ua", "sec-ch-ua-platform", "accept-language"]
+        );
     }
 }
 
@@ -189,6 +442,25 @@ async fn fetch_file_url(url: &Url) -> Result<Response, ObscuraNetError> {
     })
 }
 
+fn synthetic_blocked_response(url: &Url) -> Response {
+    let mut headers = HashMap::new();
+    let (content_type, body): (&str, Vec<u8>) = if url.path().ends_with(".json") {
+        ("application/json; charset=utf-8", b"{}".to_vec())
+    } else {
+        ("application/javascript; charset=utf-8", Vec::new())
+    };
+    headers.insert("content-type".to_string(), content_type.to_string());
+    headers.insert("cache-control".to_string(), "no-store".to_string());
+
+    Response {
+        url: url.clone(),
+        status: 200,
+        headers,
+        body,
+        redirected_from: Vec::new(),
+    }
+}
+
 pub struct ObscuraHttpClient {
     client: tokio::sync::OnceCell<Client>,
     proxy_url: Option<String>,
@@ -202,6 +474,7 @@ pub struct ObscuraHttpClient {
     pub in_flight: Arc<std::sync::atomic::AtomicU32>,
     pub block_trackers: bool,
     pub tracker_blocklist_config: BlocklistConfig,
+    pub transport_mode: RwLock<TransportMode>,
 }
 
 impl ObscuraHttpClient {
@@ -229,6 +502,7 @@ impl ObscuraHttpClient {
             timeout: Duration::from_secs(30),
             block_trackers: false,
             tracker_blocklist_config: BlocklistConfig::default(),
+            transport_mode: RwLock::new(TransportMode::NonFingerprintable),
         }
     }
 
@@ -316,7 +590,8 @@ impl ObscuraHttpClient {
             }
 
             let ua = self.user_agent.read().await.clone();
-            let mut headers = non_fingerprintable_base_headers(&ua);
+            let transport_mode = self.transport_mode.read().await.clone();
+            let mut headers = self.base_headers_for_mode(&ua, &transport_mode)?;
 
             let cookie_header = self.cookie_jar.get_cookie_header(&current_url);
             if !cookie_header.is_empty() {
@@ -433,6 +708,78 @@ impl ObscuraHttpClient {
         *self.extra_headers.write().await = headers;
     }
 
+    pub async fn set_transport_mode(&self, mode: TransportMode) -> Result<(), ObscuraNetError> {
+        if let TransportMode::Fingerprinted(cfg) = &mode {
+            cfg.validate()?;
+        }
+        *self.transport_mode.write().await = mode;
+        Ok(())
+    }
+
+    fn base_headers_for_mode(
+        &self,
+        ua: &str,
+        mode: &TransportMode,
+    ) -> Result<HeaderMap, ObscuraNetError> {
+        match mode {
+            TransportMode::NonFingerprintable => Ok(non_fingerprintable_base_headers(ua)),
+            TransportMode::Fingerprinted(cfg) => {
+                let mut headers = HeaderMap::new();
+                headers.insert(USER_AGENT, HeaderValue::from_str(ua).unwrap_or_else(|_| {
+                    HeaderValue::from_static(
+                        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+                    )
+                }));
+                headers.insert(
+                    HeaderName::from_static("x-obscura-client-profile"),
+                    HeaderValue::from_static("fingerprinted"),
+                );
+                self.enforce_handshake_fingerprint(cfg)?;
+                self.insert_profile_headers(&mut headers, &cfg.headers)?;
+                Ok(headers)
+            }
+        }
+    }
+
+    fn insert_profile_headers(
+        &self,
+        headers: &mut HeaderMap,
+        profile: &BrowserHeaderProfile,
+    ) -> Result<(), ObscuraNetError> {
+        for (name, value) in profile.ordered_pairs() {
+            let header_name = HeaderName::from_static(name);
+            let header_value = HeaderValue::from_str(value).map_err(|e| {
+                ObscuraNetError::FingerprintConfig(format!(
+                    "Invalid profile header {} value: {}",
+                    name, e
+                ))
+            })?;
+            headers.insert(header_name, header_value);
+        }
+        Ok(())
+    }
+
+    fn enforce_handshake_fingerprint(
+        &self,
+        cfg: &FingerprintedTransportConfig,
+    ) -> Result<(), ObscuraNetError> {
+        cfg.validate()?;
+        let mut ordered_settings = BTreeMap::new();
+        for (idx, (name, value)) in cfg.http2.settings_in_order.iter().enumerate() {
+            ordered_settings.insert(idx, (name, value));
+        }
+        for (idx, required_name) in REQUIRED_HTTP2_SETTINGS_ORDER.iter().enumerate() {
+            let present = ordered_settings.get(&idx).map(|(name, _)| name.as_str());
+            if present != Some(*required_name) {
+                return Err(ObscuraNetError::FingerprintConfig(format!(
+                    "Handshake creation rejected: setting at index {} must be {}",
+                    idx, required_name
+                )));
+            }
+        }
+        Ok(())
+    }
+
     pub fn active_requests(&self) -> u32 {
         self.in_flight.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -449,7 +796,7 @@ impl Default for ObscuraHttpClient {
 }
 
 #[cfg(test)]
-mod tests {
+mod client_tests {
     use super::*;
 
     #[tokio::test]
@@ -486,6 +833,23 @@ mod tests {
         assert_eq!(response.header("cache-control"), Some("no-store"));
         assert_eq!(response.body, b"{}");
     }
+
+    #[tokio::test]
+    async fn blocked_tracker_document_gets_minimal_html_body() {
+        let mut client = ObscuraHttpClient::new();
+        client.block_trackers = true;
+
+        let url = Url::parse("https://doubleclick.net/track").unwrap();
+        let response = client.fetch(&url).await.unwrap();
+
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            response.header("content-type"),
+            Some("text/html; charset=utf-8")
+        );
+        assert_eq!(response.header("cache-control"), Some("no-store"));
+        assert!(!response.body.is_empty());
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -498,4 +862,7 @@ pub enum ObscuraNetError {
 
     #[error("Request blocked: {0}")]
     Blocked(String),
+
+    #[error("Fingerprint configuration error: {0}")]
+    FingerprintConfig(String),
 }
