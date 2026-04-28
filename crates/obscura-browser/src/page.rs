@@ -164,6 +164,7 @@ impl Page {
         }
 
         let mut rt = ObscuraJsRuntime::with_base_url(&self.url_string());
+        rt.set_browser_profile(&self.context.profile.to_js_object_literal());
         rt.set_url(&self.url_string());
         rt.set_title(&self.title);
 
