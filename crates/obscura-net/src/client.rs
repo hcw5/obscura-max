@@ -254,6 +254,38 @@ async fn fetch_file_url(url: &Url) -> Result<Response, ObscuraNetError> {
     })
 }
 
+fn synthetic_blocked_response(url: &Url) -> Response {
+    let path = url.path().to_ascii_lowercase();
+    let is_json = path.ends_with(".json") || path.contains("/collect") || path.contains("/events");
+
+    let mut headers = HashMap::new();
+    headers.insert(
+        "cache-control".to_string(),
+        "no-store".to_string(),
+    );
+    headers.insert(
+        "x-obscura-blocked".to_string(),
+        "tracker".to_string(),
+    );
+    headers.insert(
+        "content-type".to_string(),
+        if is_json {
+            "application/json; charset=utf-8"
+        } else {
+            "application/javascript; charset=utf-8"
+        }
+        .to_string(),
+    );
+
+    Response {
+        url: url.clone(),
+        status: 200,
+        headers,
+        body: if is_json { b"{}".to_vec() } else { Vec::new() },
+        redirected_from: Vec::new(),
+    }
+}
+
 pub struct ObscuraHttpClient {
     client: tokio::sync::OnceCell<Client>,
     proxy_url: Option<String>,
