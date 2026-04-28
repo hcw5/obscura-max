@@ -1097,63 +1097,70 @@ function _registerIframe(iframeEl) {
     enumerable: false,
   });
 }
+globalThis.__obscura_profile = globalThis.__obscura_profile || {};
+function _profile(key, fallback) {
+  const v = globalThis.__obscura_profile?.[key];
+  return v === undefined ? fallback : v;
+}
+function _mkPluginArray() {
+  const p = (_profile('plugins', []) || []).map(x => ({ ...x }));
+  p.item = (i) => p[i] || null;
+  p.namedItem = (name) => p.find(x => x.name === name) || null;
+  p.refresh = () => {};
+  return p;
+}
+function _mkMimeTypeArray() {
+  const m = (_profile('mimeTypes', []) || []).map(x => ({ ...x }));
+  m.item = (i) => m[i] || null;
+  m.namedItem = (name) => m.find(x => x.type === name) || null;
+  return m;
+}
+function _mkUserAgentData() {
+  const brands = [
+    {brand: "Google Chrome", version: "145"},
+    {brand: "Chromium", version: "145"},
+    {brand: "Not=A?Brand", version: "24"},
+  ];
+  const fullVersionList = [
+    {brand:"Google Chrome",version:"145.0.0.0"},
+    {brand:"Chromium",version:"145.0.0.0"},
+    {brand:"Not=A?Brand",version:"24.0.0.0"},
+  ];
+  const lowEntropy = { brands, mobile: false, platform: _profile('uaDataPlatform', 'Linux') };
+  const highEntropy = {
+    architecture: "x86",
+    bitness: "64",
+    brands,
+    fullVersionList,
+    mobile: false,
+    model: "",
+    platform: _profile('uaDataPlatform', 'Linux'),
+    platformVersion: "6.8.0",
+    uaFullVersion: "145.0.0.0",
+  };
+  return {
+    ...lowEntropy,
+    getHighEntropyValues(hints) {
+      const req = Array.isArray(hints) ? hints : [];
+      const out = {};
+      for (const k of req) if (k in highEntropy) out[k] = highEntropy[k];
+      out.brands = brands;
+      out.mobile = false;
+      out.platform = _profile('uaDataPlatform', 'Linux');
+      return Promise.resolve(out);
+    },
+    toJSON() { return lowEntropy; },
+  };
+}
 globalThis.navigator = {
   get userAgent() { return globalThis.__obscura_ua || "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"; },
   get appVersion() { return this.userAgent.replace('Mozilla/', ''); },
-  language: "en-US", languages: ["en-US","en"], platform: "Linux x86_64",
-  onLine: true, cookieEnabled: true, hardwareConcurrency: 8,
+  onLine: true, cookieEnabled: true,
   maxTouchPoints: 0,
   vendor: "Google Inc.", product: "Gecko", productSub: "20030107",
   doNotTrack: null,
-  deviceMemory: 8,
   connection: { effectiveType: "4g", rtt: 50, downlink: 10, saveData: false },
-  get webdriver() { return undefined; },
   pdfViewerEnabled: true,
-  get plugins() {
-    const p = [
-      { name: "PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format", length: 1 },
-      { name: "Chrome PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format", length: 1 },
-      { name: "Chromium PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format", length: 1 },
-      { name: "Microsoft Edge PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format", length: 1 },
-      { name: "WebKit built-in PDF", filename: "internal-pdf-viewer", description: "Portable Document Format", length: 1 },
-    ];
-    p.item = (i) => p[i] || null;
-    p.namedItem = (name) => p.find(x => x.name === name) || null;
-    p.refresh = () => {};
-    return p;
-  },
-  get mimeTypes() {
-    const m = [
-      { type: "application/pdf", description: "Portable Document Format", suffixes: "pdf", enabledPlugin: null },
-      { type: "text/pdf", description: "Portable Document Format", suffixes: "pdf", enabledPlugin: null },
-    ];
-    m.item = (i) => m[i] || null;
-    m.namedItem = (name) => m.find(x => x.type === name) || null;
-    return m;
-  },
-  userAgentData: {
-    brands: [
-      {brand: "Google Chrome", version: "145"},
-      {brand: "Chromium", version: "145"},
-      {brand: "Not=A?Brand", version: "24"},
-    ],
-    mobile: false,
-    platform: "Linux",
-    getHighEntropyValues(hints) {
-      return Promise.resolve({
-        architecture: "x86",
-        bitness: "64",
-        brands: [{brand:"Google Chrome",version:"145"},{brand:"Chromium",version:"145"},{brand:"Not=A?Brand",version:"24"}],
-        fullVersionList: [{brand:"Google Chrome",version:"145.0.0.0"},{brand:"Chromium",version:"145.0.0.0"},{brand:"Not=A?Brand",version:"24.0.0.0"}],
-        mobile: false,
-        model: "",
-        platform: "Linux",
-        platformVersion: "6.8.0",
-        uaFullVersion: "145.0.0.0",
-      });
-    },
-    toJSON() { return {brands:this.brands,mobile:this.mobile,platform:this.platform}; },
-  },
   serviceWorker: { ready: Promise.resolve(), register(){return Promise.resolve();}, getRegistrations(){return Promise.resolve([]);}, controller: null },
   mediaDevices: {
     enumerateDevices() {
@@ -1170,21 +1177,59 @@ globalThis.navigator = {
   },
   clipboard: { writeText(){return Promise.resolve();}, readText(){return Promise.resolve("");} },
   permissions: { query(params){
-    if (params?.name === 'notifications') return Promise.resolve({state:"prompt",onchange:null});
-    return Promise.resolve({state:"granted"});
+    const name = params?.name;
+    const defaults = _profile('permissions', {});
+    const state =
+      name === 'notifications' ? (defaults.notifications || 'default')
+      : name === 'geolocation' ? (defaults.geolocation || 'prompt')
+      : (defaults.default || 'granted');
+    return Promise.resolve({state,onchange:null});
   } },
-  getBattery() { return Promise.resolve({ charging: _fp('batteryCharging'), chargingTime: _fp('batteryCharging') ? 0 : Infinity, dischargingTime: _fp('batteryCharging') ? Infinity : Math.floor(3600 + _fpRand(250) * 7200), level: _fp('batteryLevel'), addEventListener(){} }); },
+  getBattery() {
+    const charging = (_profile('batteryCharging', _fp('batteryCharging')) === true);
+    const level = Number(_profile('batteryLevel', _fp('batteryLevel')));
+    const discharging = Number(_profile('batteryDischargingTime', Math.floor(3600 + _fpRand(250) * 7200)));
+    return Promise.resolve({
+      charging,
+      chargingTime: charging ? 0 : Infinity,
+      dischargingTime: charging ? Infinity : (Number.isFinite(discharging) ? discharging : Infinity),
+      level: Math.max(0, Math.min(1, level)),
+      addEventListener(){},
+      removeEventListener(){},
+      dispatchEvent(){ return true; },
+    });
+  },
   getGamepads() { return []; },
   sendBeacon() { return true; },
   javaEnabled() { return false; },
 };
 
-globalThis.chrome = {
-  app: { isInstalled: false, InstallState: { DISABLED: "disabled", INSTALLED: "installed", NOT_INSTALLED: "not_installed" }, RunningState: { CANNOT_RUN: "cannot_run", READY_TO_RUN: "ready_to_run", RUNNING: "running" } },
-  runtime: { OnInstalledReason: {}, OnRestartRequiredReason: {}, PlatformArch: {}, PlatformNaclArch: {}, PlatformOs: {}, RequestUpdateCheckStatus: {}, connect() { return {}; }, sendMessage() {} },
-  csi() { return {}; },
-  loadTimes() { return {}; },
-};
+function _defineNavigatorDescriptors() {
+  const frozenLanguages = Object.freeze([].concat(_profile('languages', ['en-US', 'en'])));
+  const uaData = _mkUserAgentData();
+  const descriptors = {
+    webdriver: { get() { return _profile('webdriver', false) ? true : undefined; }, enumerable: true, configurable: true },
+    plugins: { get() { return _mkPluginArray(); }, enumerable: true, configurable: true },
+    mimeTypes: { get() { return _mkMimeTypeArray(); }, enumerable: true, configurable: true },
+    hardwareConcurrency: { get() { return _profile('hardwareConcurrency', 8); }, enumerable: true, configurable: true },
+    deviceMemory: { get() { return _profile('deviceMemory', 8); }, enumerable: true, configurable: true },
+    language: { get() { return _profile('language', 'en-US'); }, enumerable: true, configurable: true },
+    languages: { get() { return frozenLanguages; }, enumerable: true, configurable: true },
+    platform: { get() { return _profile('platform', 'Linux x86_64'); }, enumerable: true, configurable: true },
+    userAgentData: { get() { return uaData; }, enumerable: true, configurable: true },
+  };
+  for (const [k, d] of Object.entries(descriptors)) Object.defineProperty(globalThis.navigator, k, d);
+}
+
+function _mkChromeObject() {
+  return {
+    app: { isInstalled: false, InstallState: { DISABLED: "disabled", INSTALLED: "installed", NOT_INSTALLED: "not_installed" }, RunningState: { CANNOT_RUN: "cannot_run", READY_TO_RUN: "ready_to_run", RUNNING: "running" } },
+    runtime: { OnInstalledReason: {}, OnRestartRequiredReason: {}, PlatformArch: {}, PlatformNaclArch: {}, PlatformOs: {}, RequestUpdateCheckStatus: {}, connect() { return {}; }, sendMessage() {} },
+    csi() { return {}; },
+    loadTimes() { return {}; },
+  };
+}
+globalThis.chrome = _mkChromeObject();
 
 globalThis.Notification = class Notification {
   static permission = "default";
@@ -1891,8 +1936,44 @@ globalThis.XMLSerializer = class XMLSerializer {
     return "";
   }
 };
+let __obscura_perfTask = 0;
+const __obscura_perfJitterCache = new Map();
+const __obscura_perfStart = Date.now();
+function __obscura_perfHash(x) {
+  let h = x | 0;
+  h = Math.imul(h ^ (h >>> 16), 0x45d9f3b);
+  h = Math.imul(h ^ (h >>> 13), 0x45d9f3b);
+  return (h ^ (h >>> 16)) >>> 0;
+}
+function __obscura_perfNow() {
+  const elapsed = Date.now() - __obscura_perfStart;
+  const quant = Math.floor((elapsed * 1000) / 100) * 0.1; // 100us buckets
+  const key = `${__obscura_perfTask}:${quant}`;
+  let jitter = __obscura_perfJitterCache.get(key);
+  if (jitter === undefined) {
+    jitter = ((__obscura_perfHash(__obscura_perfTask ^ Math.floor(quant * 10)) / 0xFFFFFFFF) - 0.5) * 0.08;
+    __obscura_perfJitterCache.set(key, jitter);
+    if (__obscura_perfJitterCache.size > 4096) __obscura_perfJitterCache.clear();
+  }
+  return Math.max(0, quant + jitter);
+}
+function __obscura_wrapTaskScheduler(name) {
+  const orig = globalThis[name];
+  if (typeof orig !== 'function') return;
+  globalThis[name] = function(cb, ...rest) {
+    if (typeof cb !== 'function') return orig.call(this, cb, ...rest);
+    const wrapped = (...args) => {
+      __obscura_perfTask = (__obscura_perfTask + 1) >>> 0;
+      return cb(...args);
+    };
+    return orig.call(this, wrapped, ...rest);
+  };
+}
+__obscura_wrapTaskScheduler('setTimeout');
+__obscura_wrapTaskScheduler('setInterval');
+__obscura_wrapTaskScheduler('queueMicrotask');
 globalThis.performance = globalThis.performance || {
-  now: () => Date.now(),
+  now: () => __obscura_perfNow(),
   mark(){}, measure(){},
   clearMarks(){}, clearMeasures(){}, clearResourceTimings(){},
   getEntries(){return [];}, getEntriesByName(){return [];}, getEntriesByType(){return [];},
@@ -3012,6 +3093,12 @@ if (typeof Document !== 'undefined' && !Document.prototype.importNode) {
   Document.prototype.importNode = function(node, deep) { return node?.cloneNode(!!deep) || null; };
 }
 
+globalThis.__obscura_applyProfile = function(profile) {
+  if (profile && typeof profile === 'object') globalThis.__obscura_profile = profile;
+  _defineNavigatorDescriptors();
+  globalThis.chrome = _mkChromeObject();
+};
+
 globalThis.__obscura_init = function() {
   if (_fpSessionSeed === null) {
     _fpSessionSeed = Date.now() ^ (Math.random() * 0xFFFFFFFF >>> 0);
@@ -3034,6 +3121,7 @@ globalThis.__obscura_init = function() {
   const t0 = Date.now();
   globalThis.performance.timeOrigin = t0;
   globalThis.performance.timing = { navigationStart: t0, domContentLoadedEventEnd: t0, loadEventEnd: t0 };
+  globalThis.__obscura_applyProfile(globalThis.__obscura_profile);
 
   const hide = (obj, props) => {
     for (const p of props) {

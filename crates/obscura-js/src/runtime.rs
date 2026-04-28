@@ -108,6 +108,14 @@ impl ObscuraJsRuntime {
             format!("globalThis.__obscura_ua = '{}';", escaped),
         );
     }
+
+    pub fn set_browser_profile(&mut self, profile: &str) {
+        let code = format!(
+            "globalThis.__obscura_profile = {profile};\
+             if (typeof globalThis.__obscura_applyProfile === 'function') globalThis.__obscura_applyProfile(globalThis.__obscura_profile);"
+        );
+        let _ = self.runtime.execute_script("<set-profile>", code);
+    }
     pub fn evaluate(&mut self, expression: &str) -> Result<serde_json::Value, String> {
         let wrapped = Self::wrap_expression(expression);
         let result = self
@@ -875,23 +883,36 @@ mod tests {
 
     #[test]
     fn test_inner_text_skips_display_none() {
-        let mut rt = setup_runtime(r#"<div id="root">Visible <span id="hidden">gone</span><span>text</span></div>"#);
-        rt.evaluate("document.getElementById('hidden').style.display = 'none'").unwrap();
-        let text = rt.evaluate("document.getElementById('root').innerText").unwrap();
+        let mut rt = setup_runtime(
+            r#"<div id="root">Visible <span id="hidden">gone</span><span>text</span></div>"#,
+        );
+        rt.evaluate("document.getElementById('hidden').style.display = 'none'")
+            .unwrap();
+        let text = rt
+            .evaluate("document.getElementById('root').innerText")
+            .unwrap();
         assert_eq!(text, serde_json::json!("Visible text"));
     }
 
     #[test]
     fn test_inner_text_respects_nested_block_boundaries() {
-        let mut rt = setup_runtime(r#"<div id="root"><div>First <span>line</span></div><div>Second</div></div>"#);
-        let text = rt.evaluate("document.getElementById('root').innerText").unwrap();
+        let mut rt = setup_runtime(
+            r#"<div id="root"><div>First <span>line</span></div><div>Second</div></div>"#,
+        );
+        let text = rt
+            .evaluate("document.getElementById('root').innerText")
+            .unwrap();
         assert_eq!(text, serde_json::json!("First line\nSecond"));
     }
 
     #[test]
     fn test_inner_text_normalizes_whitespace() {
-        let mut rt = setup_runtime(r#"<div id="root">  Alpha   <span>  Beta </span>  <span>Gamma</span> </div>"#);
-        let text = rt.evaluate("document.getElementById('root').innerText").unwrap();
+        let mut rt = setup_runtime(
+            r#"<div id="root">  Alpha   <span>  Beta </span>  <span>Gamma</span> </div>"#,
+        );
+        let text = rt
+            .evaluate("document.getElementById('root').innerText")
+            .unwrap();
         assert_eq!(text, serde_json::json!("Alpha Beta Gamma"));
     }
 
@@ -996,17 +1017,28 @@ mod tests {
             "anisotropic extension should be advertised"
         );
         assert!(
-            obj.get("vendor").unwrap().as_str().unwrap().contains("Google Inc."),
+            obj.get("vendor")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .contains("Google Inc."),
             "unmasked vendor should be coherent: {:?}",
             obj.get("vendor")
         );
         assert!(
-            obj.get("renderer").unwrap().as_str().unwrap().contains("ANGLE"),
+            obj.get("renderer")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .contains("ANGLE"),
             "unmasked renderer should be coherent: {:?}",
             obj.get("renderer")
         );
         assert_eq!(obj.get("glVendor").unwrap(), &serde_json::json!("WebKit"));
-        assert_eq!(obj.get("glRenderer").unwrap(), &serde_json::json!("WebKit WebGL"));
+        assert_eq!(
+            obj.get("glRenderer").unwrap(),
+            &serde_json::json!("WebKit WebGL")
+        );
         assert!(
             obj.get("glVersion")
                 .unwrap()
@@ -1067,7 +1099,10 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(before, after, "webgl profile should remain stable within one runtime session");
+        assert_eq!(
+            before, after,
+            "webgl profile should remain stable within one runtime session"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
