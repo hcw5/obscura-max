@@ -193,58 +193,82 @@ impl Page {
     }
 
     async fn execute_scripts(&mut self) {
-        tracing::info!(
-            "execute_scripts called, js runtime exists: {}",
-            self.js.is_some()
-        );
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum ScriptKind {
+            ParserBlockingClassic,
+            DeferClassic,
+            DeferModule,
+            AsyncClassic,
+            AsyncModule,
+        }
 
-        #[derive(Debug)]
+        #[derive(Debug, Clone)]
         struct ScriptInfo {
             src: Option<String>,
             inline: String,
-            is_defer: bool,
-            is_async: bool,
-            is_module: bool,
+            kind: ScriptKind,
+        }
+
+        #[derive(Debug)]
+        struct AsyncFetchedScript {
+            script: ScriptInfo,
+            url: String,
+            response: Response,
+            code: String,
         }
 
         let all_scripts = match &self.js {
             Some(js) => js
                 .with_dom(|dom| {
-                    let script_ids = dom.query_selector_all("script").unwrap_or_default();
                     let mut scripts = Vec::new();
+                    for sid in dom.query_selector_all("script").unwrap_or_default() {
+                        let Some(node) = dom.get_node(sid) else {
+                            continue;
+                        };
 
-                    for sid in script_ids {
-                        if let Some(node) = dom.get_node(sid) {
-                            let src = node.get_attribute("src").map(|s| s.to_string());
-                            let script_type = node.get_attribute("type").unwrap_or("").to_string();
-                            let is_defer = node.get_attribute("defer").is_some();
-                            let is_async = node.get_attribute("async").is_some();
-                            let is_module = script_type == "module";
+                        let src = node.get_attribute("src").map(|s| s.to_string());
+                        let script_type = node.get_attribute("type").unwrap_or("").to_string();
+                        let is_defer = node.get_attribute("defer").is_some();
+                        let is_async = node.get_attribute("async").is_some();
+                        let is_module = script_type == "module";
 
-                            if !script_type.is_empty()
-                                && script_type != "text/javascript"
-                                && script_type != "application/javascript"
-                                && script_type != "module"
-                            {
-                                continue;
-                            }
-
-                            let inline_code = if src.is_none() {
-                                dom.text_content(sid)
-                            } else {
-                                String::new()
-                            };
-
-                            if src.is_some() || !inline_code.trim().is_empty() {
-                                scripts.push(ScriptInfo {
-                                    src,
-                                    inline: inline_code,
-                                    is_defer,
-                                    is_async,
-                                    is_module,
-                                });
-                            }
+                        if !script_type.is_empty()
+                            && script_type != "text/javascript"
+                            && script_type != "application/javascript"
+                            && script_type != "module"
+                        {
+                            continue;
                         }
+
+                        let inline_code = if src.is_none() {
+                            dom.text_content(sid)
+                        } else {
+                            String::new()
+                        };
+
+                        if src.is_none() && inline_code.trim().is_empty() {
+                            continue;
+                        }
+
+                        let kind = if is_module {
+                            if is_async {
+                                ScriptKind::AsyncModule
+                            } else {
+                                ScriptKind::DeferModule
+                            }
+                        } else if is_async {
+                            ScriptKind::AsyncClassic
+                        } else if is_defer {
+                            ScriptKind::DeferClassic
+                        } else {
+                            ScriptKind::ParserBlockingClassic
+                        };
+
+                        scripts.push(ScriptInfo {
+                            src,
+                            inline: inline_code,
+                            kind,
+                        });
                     }
                     scripts
                 })
@@ -265,255 +289,164 @@ impl Page {
         };
 
         let mut parser_blocking_classic = Vec::new();
-        let mut defer_classic = Vec::new();
-        let mut async_classic = Vec::new();
-        let mut defer_module = Vec::new();
-        let mut async_module = Vec::new();
+        let mut defer_queue = Vec::new();
+        let mut async_scripts = Vec::new();
 
         for script in all_scripts {
-            if script.is_module {
-                if script.is_async {
-                    async_module.push(script);
-                } else {
-                    defer_module.push(script);
-                }
-            } else if script.is_async {
-                async_classic.push(script);
-            } else if script.is_defer {
-                defer_classic.push(script);
-            } else {
-                parser_blocking_classic.push(script);
+            match script.kind {
+                ScriptKind::ParserBlockingClassic => parser_blocking_classic.push(script),
+                ScriptKind::DeferClassic | ScriptKind::DeferModule => defer_queue.push(script),
+                ScriptKind::AsyncClassic | ScriptKind::AsyncModule => async_scripts.push(script),
             }
         }
-
-        let scripts = regular;
-
         tracing::info!(
-            "Found {} regular + {} deferred + {} async scripts",
-            scripts.len(),
-            deferred.len(),
-            async_scripts.len()
+            "Found {} parser-blocking, {} defer-classic, {} async-classic, {} defer-module, {} async-module scripts",
+            parser_blocking_classic.len(),
+            defer_classic.len(),
+            async_classic.len(),
+            defer_module.len(),
+            async_module.len()
         );
-        let all_to_execute: Vec<ScriptInfo> = scripts
-            .into_iter()
-            .chain(deferred.into_iter())
-            .chain(async_scripts.into_iter())
-            .collect();
 
-        let mut resolved: Vec<(usize, String)> = Vec::new();
-        let mut fetch_tasks: Vec<(usize, String)> = Vec::new();
-
-        for (i, script) in all_to_execute.iter().enumerate() {
-            if let Some(src_url) = &script.src {
-                let full_url = if src_url.starts_with("http://") || src_url.starts_with("https://")
-                {
-                    src_url.clone()
-                } else if let Some(base) = &self.url {
-                    base.join(src_url)
-                        .map(|u| u.to_string())
-                        .unwrap_or_else(|_| src_url.clone())
-                } else {
-                    src_url.clone()
-                };
-
-        for script in &parser_blocking_classic {
-            if let Some(src) = &script.src {
-                let full_url = resolve_script_url(src, self.url.as_ref());
-                if self.should_block_url(&full_url) {
-                    tracing::info!(
-                        "Blocked parser-blocking script by interception: {}",
-                        full_url
-                    );
-                    continue;
-                }
-                let parsed =
-                    Url::parse(&full_url).unwrap_or_else(|_| Url::parse("about:blank").unwrap());
-                match self.do_fetch(&parsed).await {
-                    Ok(resp) => {
-                        let code = String::from_utf8_lossy(&resp.body).to_string();
-                        self.record_network_event(
-                            &full_url,
-                            "GET",
-                            "Script",
-                            resp.status,
-                            &resp.headers,
-                            resp.body.len(),
-                        );
-                        if let Some(js) = &mut self.js {
-                            if let Err(e) = js.execute_script_guarded(&full_url, &code) {
-                                tracing::warn!(
-                                    "Parser-blocking script error ({}): {}",
-                                    full_url,
-                                    e
-                                );
-                            }
+            if let Some(js) = &mut page.js {
+                match script.kind {
+                    ScriptKind::DeferModule | ScriptKind::AsyncModule => {
+                        if let Err(e) = js.load_inline_module(&code, url).await {
+                            tracing::warn!("Module script error ({}): {}", url, e);
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to fetch parser-blocking script {}: {}",
-                            full_url,
-                            e
-                        );
-                    }
-                }
-            } else if !script.inline.trim().is_empty() {
-                if let Some(js) = &mut self.js {
-                    if let Err(e) = js.execute_script_guarded("<inline>", &script.inline) {
-                        tracing::warn!("Inline parser-blocking script error: {}", e);
-                    }
-                }
-            }
-        }
-
-        let page = self;
-        let fetch_futures: Vec<_> = fetch_tasks
-            .iter()
-            .map(|(idx, url)| {
-                let url = url.clone();
-                let idx = *idx;
-                async move {
-                    let parsed =
-                        Url::parse(&url).unwrap_or_else(|_| Url::parse("about:blank").unwrap());
-                    match page.do_fetch(&parsed).await {
-                        Ok(resp) => Some((idx, url, resp)),
-                        Err(e) => {
-                            tracing::warn!("Failed to fetch script {}: {}", url, e);
-                            None
+                    _ => {
+                        if let Err(e) = js.execute_script_guarded(url, &code) {
+                            tracing::warn!("Classic script error ({}): {}", url, e);
                         }
-                    }
-                }
-            })
-            .collect();
-
-        let fetch_results = futures::future::join_all(fetch_futures).await;
-
-        let mut fetched: std::collections::HashMap<usize, (String, String, obscura_net::Response)> =
-            std::collections::HashMap::new();
-        for result in fetch_results {
-            if let Some((idx, url, resp)) = result {
-                let code = String::from_utf8_lossy(&resp.body).to_string();
-                fetched.insert(idx, (url, code, resp));
-            }
-        }
-
-        for (i, script) in all_to_execute.iter().enumerate() {
-            if script.src.is_some() {
-                if let Some((url, code, resp)) = fetched.remove(&i) {
-                    tracing::info!("Executing script ({} bytes): {}", code.len(), url);
-                    self.record_network_event(
-                        &url,
-                        "GET",
-                        "Script",
-                        resp.status,
-                        &resp.headers,
-                        resp.body.len(),
-                    );
-                    if let Some(js) = &mut self.js {
-                        if let Err(e) = js.execute_script_guarded(&url, &code) {
-                            tracing::warn!("Script error ({}): {}", url, e);
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to fetch module script {}: {}", full_url, e);
-                    }
-                }
-            } else if !script.inline.trim().is_empty() {
-                let base = page.url_string();
-                if let Some(js) = &mut page.js {
-                    if let Err(e) = js.load_inline_module(&script.inline, &base).await {
-                        tracing::warn!("Inline module script error: {}", e);
                     }
                 }
             }
         };
 
+        // Phase 1: parser-blocking classic scripts execute synchronously in document order.
+        for script in &parser_blocking_classic {
+            if let Some(src) = &script.src {
+                let full_url = resolve_script_url(src, self.url.as_ref());
+                if self.should_block_url(&full_url) {
+                    tracing::info!("Blocked parser-blocking script by interception: {}", full_url);
+                    continue;
+                }
+
+                let parsed =
+                    Url::parse(&full_url).unwrap_or_else(|_| Url::parse("about:blank").unwrap());
+                match self.do_fetch(&parsed).await {
+                    Ok(response) => {
+                        let code = String::from_utf8_lossy(&response.body).to_string();
+                        self.record_network_event(
+                            &full_url,
+                            "GET",
+                            "Script",
+                            response.status,
+                            &response.headers,
+                            response.body.len(),
+                        );
+                        if let Some(js) = &mut self.js {
+                            if let Err(e) = js.execute_script_guarded(&full_url, &code) {
+                                tracing::warn!("Parser-blocking script error ({}): {}", full_url, e);
+                            }
+                        }
+                    }
+                    Err(e) => tracing::warn!(
+                        "Failed to fetch parser-blocking script {}: {}",
+                        full_url,
+                        e
+                    ),
+                }
+            } else {
+                execute_inline(self, script, "<inline-parser-blocking>").await;
+            }
+        }
+
         for script in &defer_classic {
-            execute_defer_classic(script, self).await;
-        }
-        for script in &defer_module {
-            execute_module_script(script, self).await;
-        }
-
-        for module_script in &module_scripts {
-            if let Some(ref src) = module_script.src {
-                let full_url = if src.starts_with("http://") || src.starts_with("https://") {
-                    src.clone()
-                } else if let Some(base) = &self.url {
-                    base.join(src)
-                        .map(|u| u.to_string())
-                        .unwrap_or_else(|_| src.clone())
-                } else {
-                    src.clone()
-                };
-
-                tracing::info!("Loading ES module: {}", full_url);
+            if let Some(src) = &script.src {
+                let full_url = resolve_script_url(src, self.url.as_ref());
+                if self.should_block_url(&full_url) {
+                    tracing::info!("Blocked defer script by interception: {}", full_url);
+                    continue;
+                }
+                let parsed =
+                    Url::parse(&full_url).unwrap_or_else(|_| Url::parse("about:blank").unwrap());
+                match self.do_fetch(&parsed).await {
+                    Ok(response) => {
+                        let code = String::from_utf8_lossy(&response.body).to_string();
+                        self.record_network_event(
+                            &full_url,
+                            "GET",
+                            "Script",
+                            response.status,
+                            &response.headers,
+                            response.body.len(),
+                        );
+                        if let Some(js) = &mut self.js {
+                            if let Err(e) = js.execute_script_guarded(&full_url, &code) {
+                                tracing::warn!("Defer script error ({}): {}", full_url, e);
+                            }
+                        }
+                    }
+                    Err(e) => tracing::warn!("Failed to fetch defer script {}: {}", full_url, e),
+                }
+            } else if !script.inline.trim().is_empty() {
                 if let Some(js) = &mut self.js {
-                    match js.load_module(&full_url).await {
-                        Ok(()) => {
-                            tracing::info!("ES module loaded: {}", full_url);
-                            self.record_network_event(
-                                &full_url,
-                                "GET",
-                                "Script",
-                                200,
-                                &std::collections::HashMap::new(),
-                                0,
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!("ES module error ({}): {}", full_url, e);
-                        }
-                    });
-                } else if !script.inline.trim().is_empty() {
-                    async_jobs.push(async move {
-                        Some(AsyncResult::ClassicInline {
-                            code: script.inline,
-                        })
-                    });
-                }
-            }
-
-            for script in async_module {
-                if let Some(src) = script.src {
-                    let full_url = resolve_script_url(&src, self.url.as_ref());
-                    if self.should_block_url(&full_url) {
-                        tracing::info!("Blocked async module by interception: {}", full_url);
-                        continue;
+                    if let Err(e) = js.execute_script_guarded("<inline>", &script.inline) {
+                        tracing::warn!("Inline defer script error: {}", e);
                     }
-                    let client = self.http_client.clone();
-                    async_jobs.push(async move {
-                        let parsed = Url::parse(&full_url)
-                            .unwrap_or_else(|_| Url::parse("about:blank").unwrap());
-                        match client.fetch(&parsed).await {
-                            Ok(response) => Some(AsyncResult::ModuleExternal {
-                                url: full_url,
-                                response,
-                            }),
-                            Err(e) => {
-                                tracing::warn!("Failed to fetch async module {}: {}", full_url, e);
-                                None
-                            }
-                        }
-                    });
-                } else if !script.inline.trim().is_empty() {
-                    async_jobs.push(async move {
-                        Some(AsyncResult::ModuleInline {
-                            code: script.inline,
-                        })
-                    });
+                }
+            } else {
+                execute_inline(self, script, "<inline-defer>").await;
+            }
+        }
+
+        let base_url = self.url_string();
+        for script in &defer_module {
+            if let Some(src) = &script.src {
+                let full_url = resolve_script_url(src, self.url.as_ref());
+                if self.should_block_url(&full_url) {
+                    tracing::info!("Blocked module script by interception: {}", full_url);
+                    continue;
+                }
+                if let Some(js) = &mut self.js {
+                    if let Err(e) = js.load_module(&full_url).await {
+                        tracing::warn!("Module script error ({}): {}", full_url, e);
+                    } else {
+                        self.record_network_event(
+                            &full_url,
+                            "GET",
+                            "Script",
+                            200,
+                            &std::collections::HashMap::new(),
+                            0,
+                        );
+                    }
+                }
+            } else if !script.inline.trim().is_empty() {
+                if let Some(js) = &mut self.js {
+                    if let Err(e) = js.load_inline_module(&script.inline, &base_url).await {
+                        tracing::warn!("Inline module script error: {}", e);
+                    }
                 }
             }
+        }
 
-            while let Some(result) = async_jobs.next().await {
-                match result {
-                    Some(AsyncResult::ClassicExternal {
-                        url,
-                        response,
-                        code,
-                    }) => {
+        for script in &async_classic {
+            if let Some(src) = &script.src {
+                let full_url = resolve_script_url(src, self.url.as_ref());
+                if self.should_block_url(&full_url) {
+                    tracing::info!("Blocked async script by interception: {}", full_url);
+                    continue;
+                }
+                let parsed =
+                    Url::parse(&full_url).unwrap_or_else(|_| Url::parse("about:blank").unwrap());
+                match self.do_subresource_fetch(&parsed).await {
+                    Ok(response) => {
+                        let code = String::from_utf8_lossy(&response.body).to_string();
                         self.record_network_event(
-                            &url,
+                            &full_url,
                             "GET",
                             "Script",
                             response.status,
@@ -521,51 +454,59 @@ impl Page {
                             response.body.len(),
                         );
                         if let Some(js) = &mut self.js {
-                            if let Err(e) = js.execute_script_guarded(&url, &code) {
-                                tracing::warn!("Async script error ({}): {}", url, e);
+                            if let Err(e) = js.execute_script_guarded(&full_url, &code) {
+                                tracing::warn!("Async script error ({}): {}", full_url, e);
                             }
                         }
                     }
-                    Some(AsyncResult::ClassicInline { code }) => {
-                        if let Some(js) = &mut self.js {
-                            if let Err(e) = js.execute_script_guarded("<inline>", &code) {
-                                tracing::warn!("Inline async script error: {}", e);
-                            }
-                        }
+                    Err(e) => tracing::warn!("Failed to fetch async script {}: {}", full_url, e),
+                }
+            } else if !script.inline.trim().is_empty() {
+                if let Some(js) = &mut self.js {
+                    if let Err(e) = js.execute_script_guarded("<inline>", &script.inline) {
+                        tracing::warn!("Inline async script error: {}", e);
                     }
-                    Some(AsyncResult::ModuleExternal { url, response }) => {
+                }
+            }
+        }
+
+        for script in &async_module {
+            if let Some(src) = &script.src {
+                let full_url = resolve_script_url(src, self.url.as_ref());
+                if self.should_block_url(&full_url) {
+                    tracing::info!("Blocked async module by interception: {}", full_url);
+                    continue;
+                }
+                if let Some(js) = &mut self.js {
+                    if let Err(e) = js.load_module(&full_url).await {
+                        tracing::warn!("Async module script error ({}): {}", full_url, e);
+                    } else {
                         self.record_network_event(
-                            &url,
+                            &full_url,
                             "GET",
                             "Script",
-                            response.status,
-                            &response.headers,
-                            response.body.len(),
+                            200,
+                            &std::collections::HashMap::new(),
+                            0,
                         );
-                        if let Some(js) = &mut self.js {
-                            if let Err(e) = js.load_module(&url).await {
-                                tracing::warn!("Async module script error ({}): {}", url, e);
-                            }
-                        }
                     }
-                    Some(AsyncResult::ModuleInline { code }) => {
-                        let base = self.url_string();
-                        if let Some(js) = &mut self.js {
-                            if let Err(e) = js.load_inline_module(&code, &base).await {
-                                tracing::warn!("Inline async module script error: {}", e);
-                            }
-                        }
+                }
+            } else if !script.inline.trim().is_empty() {
+                if let Some(js) = &mut self.js {
+                    if let Err(e) = js.load_inline_module(&script.inline, &base_url).await {
+                        tracing::warn!("Inline async module script error: {}", e);
                     }
-                    None => {}
                 }
             }
         }
 
         if let Some(js) = &mut self.js {
-            let _ = js.execute_script("<load-events>",
-                "if (typeof window.onload === 'function') { try { window.onload(); } catch(e) {} }\n\
-                 try { document.dispatchEvent(new Event('DOMContentLoaded')); } catch(e) {}\n\
-                 try { window.dispatchEvent(new Event('load')); } catch(e) {}");
+            let _ = js.execute_script(
+                "<load-events>",
+                "if (typeof window.onload === 'function') { try { window.onload(); } catch(e) {} }
+                 try { document.dispatchEvent(new Event('DOMContentLoaded')); } catch(e) {}
+                 try { window.dispatchEvent(new Event('load')); } catch(e) {}",
+            );
         }
 
         if let Some(js) = &mut self.js {

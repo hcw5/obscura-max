@@ -186,8 +186,14 @@ Enable with `--features stealth`.
 ### Tracker Blocking
 - 3,520 domains blocked
 - Blocks analytics, ads, telemetry, and fingerprinting scripts
-- Prevents trackers from loading entirely
+- Returns synthetic HTTP 200 responses for blocked requests with empty/minimal
+  bodies by resource type (e.g. empty JS/CSS, `{}` for JSON, minimal HTML for
+  document-like requests) to preserve browser/DOM flow
 - Enabled automatically with `--stealth`
+- Policy modes:
+  - `BrowserFidelity` (default): preserves required infrastructure domains and
+    GTM (`googletagmanager.com`) for safer DOM-fidelity behavior
+  - `Strict`: blocks trackers with no allowlist exceptions (must be explicitly requested)
 
 ## CDP API
 

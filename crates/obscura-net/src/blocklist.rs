@@ -15,20 +15,47 @@ static OPTIONAL_POLICY_ALLOWLIST: &[&str] = &["googletagmanager.com"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlocklistConfig {
+    /// Policy mode that controls safe-by-default behavior for browser/DOM fidelity.
+    pub mode: BlocklistMode,
     /// Allow required infrastructure domains even when they appear on tracker lists.
     pub allow_required_infrastructure: bool,
     /// Allow optional policy-driven domains (e.g. GTM) when product policy permits it.
     pub allow_optional_policy_domains: bool,
-    /// Ignore allowlists and apply strict tracker blocking.
-    pub strict_mode: bool,
+}
+
+/// Tracker policy modes.
+///
+/// - `BrowserFidelity` (default): preserves essential infrastructure and GTM
+///   allowlists so DOM fidelity pipelines don't break by default.
+/// - `Strict`: applies tracker blocking without allowlist exceptions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlocklistMode {
+    BrowserFidelity,
+    Strict,
+}
+
+impl BlocklistMode {
+    pub fn is_strict(self) -> bool {
+        matches!(self, Self::Strict)
+    }
 }
 
 impl Default for BlocklistConfig {
     fn default() -> Self {
         Self {
+            mode: BlocklistMode::BrowserFidelity,
             allow_required_infrastructure: true,
+            allow_optional_policy_domains: true,
+        }
+    }
+}
+
+impl BlocklistConfig {
+    pub fn strict() -> Self {
+        Self {
+            mode: BlocklistMode::Strict,
+            allow_required_infrastructure: false,
             allow_optional_policy_domains: false,
-            strict_mode: false,
         }
     }
 }
@@ -85,7 +112,7 @@ pub fn is_blocked_with_config(host: &str, config: &BlocklistConfig) -> bool {
     let host = host.to_ascii_lowercase();
     let host = host.trim_end_matches('.');
 
-    if !config.strict_mode && is_allowlisted(host, config) {
+    if !config.mode.is_strict() && is_allowlisted(host, config) {
         return false;
     }
 
@@ -149,7 +176,7 @@ mod tests {
     #[test]
     fn test_optional_policy_allowlist_for_gtm() {
         let default_cfg = BlocklistConfig::default();
-        assert!(is_blocked_with_config(
+        assert!(!is_blocked_with_config(
             "www.googletagmanager.com",
             &default_cfg
         ));
@@ -163,11 +190,7 @@ mod tests {
             &policy_enabled
         ));
 
-        let strict_policy = BlocklistConfig {
-            allow_optional_policy_domains: true,
-            strict_mode: true,
-            ..BlocklistConfig::default()
-        };
+        let strict_policy = BlocklistConfig::strict();
         assert!(is_blocked_with_config(
             "www.googletagmanager.com",
             &strict_policy

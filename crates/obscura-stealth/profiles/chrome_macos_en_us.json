@@ -1,0 +1,58 @@
+{
+  "id": "chrome_macos_en_us",
+  "locale": "en-US",
+  "timezone": "America/Los_Angeles",
+  "accept_language": "en-US,en;q=0.9",
+  "languages": ["en-US", "en"],
+  "platform": "MacIntel",
+  "hardware_class": "high",
+  "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+  "screen": {
+    "width": 1728,
+    "height": 1117,
+    "avail_width": 1728,
+    "avail_height": 1077,
+    "color_depth": 24,
+    "pixel_depth": 24,
+    "device_pixel_ratio": 2.0
+  },
+  "window": {
+    "inner_width": 1440,
+    "inner_height": 900,
+    "outer_width": 1440,
+    "outer_height": 980
+  },
+  "ua_data": {
+    "brands": [
+      {"brand": "Chromium", "version": "145"},
+      {"brand": "Google Chrome", "version": "145"}
+    ],
+    "mobile": false,
+    "platform": "macOS",
+    "platform_version": "14.4.0",
+    "architecture": "x86",
+    "model": ""
+  },
+  "webgl": {
+    "vendor": "Google Inc. (Apple)",
+    "renderer": "ANGLE (Apple, Apple M3, OpenGL 4.1)"
+  },
+  "battery": {
+    "charging": false,
+    "charging_time": 0,
+    "discharging_time": 13500,
+    "level": 0.76
+  },
+  "tls": {
+    "min_version": "TLS1.2",
+    "max_version": "TLS1.3",
+    "ciphers": ["TLS_AES_128_GCM_SHA256", "TLS_CHACHA20_POLY1305_SHA256"],
+    "signature_algorithms": ["rsa_pss_rsae_sha256", "ecdsa_secp256r1_sha256"]
+  },
+  "plugins": [
+    {"name": "Chrome PDF Viewer", "filename": "internal-pdf-viewer", "description": "Portable Document Format"}
+  ],
+  "mime_types": [
+    {"type": "application/pdf", "suffixes": "pdf", "description": "Portable Document Format", "enabled_plugin": "Chrome PDF Viewer"}
+  ]
+}
