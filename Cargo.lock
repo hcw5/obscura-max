@@ -1598,6 +1598,7 @@ dependencies = [
  "obscura-dom",
  "obscura-js",
  "obscura-net",
+ "obscura-stealth",
  "serde_json",
  "thiserror",
  "tokio",
@@ -1691,6 +1692,14 @@ dependencies = [
  "url",
  "wreq",
  "wreq-util",
+]
+
+[[package]]
+name = "obscura-stealth"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -64,6 +64,71 @@ pub enum ResourceType {
 pub type RequestCallback = Arc<dyn Fn(&RequestInfo) + Send + Sync>;
 pub type ResponseCallback = Arc<dyn Fn(&RequestInfo, &Response) + Send + Sync>;
 
+fn infer_resource_type_from_url(url: &Url) -> ResourceType {
+    let path = url.path().to_ascii_lowercase();
+    if path.ends_with(".js") || path.ends_with(".mjs") {
+        return ResourceType::Script;
+    }
+    if path.ends_with(".css") {
+        return ResourceType::Stylesheet;
+    }
+    if path.ends_with(".json") {
+        return ResourceType::Fetch;
+    }
+    if [".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg", ".ico"]
+        .iter()
+        .any(|ext| path.ends_with(ext))
+    {
+        return ResourceType::Image;
+    }
+    if [".woff", ".woff2", ".ttf", ".otf"]
+        .iter()
+        .any(|ext| path.ends_with(ext))
+    {
+        return ResourceType::Font;
+    }
+    ResourceType::Document
+}
+
+fn synthetic_blocked_response(url: &Url) -> Response {
+    let resource_type = infer_resource_type_from_url(url);
+    let (content_type, body) = match resource_type {
+        ResourceType::Script => ("application/javascript; charset=utf-8", Vec::new()),
+        ResourceType::Stylesheet => ("text/css; charset=utf-8", Vec::new()),
+        ResourceType::Image => (
+            "image/gif",
+            // 1x1 transparent GIF
+            vec![
+                0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x80, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0xff, 0xff, 0xff, 0x21, 0xf9, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00, 0x2c,
+                0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x02, 0x44, 0x01, 0x00,
+                0x3b,
+            ],
+        ),
+        ResourceType::Font => ("font/woff2", Vec::new()),
+        ResourceType::Xhr | ResourceType::Fetch => {
+            ("application/json; charset=utf-8", b"{}".to_vec())
+        }
+        ResourceType::Document | ResourceType::Other => (
+            "text/html; charset=utf-8",
+            b"<!doctype html><html><head></head><body></body></html>".to_vec(),
+        ),
+    };
+
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), content_type.to_string());
+    headers.insert("cache-control".to_string(), "no-store".to_string());
+    headers.insert("content-length".to_string(), body.len().to_string());
+
+    Response {
+        url: url.clone(),
+        status: 200,
+        headers,
+        body,
+        redirected_from: Vec::new(),
+    }
+}
+
 fn non_fingerprintable_base_headers(ua: &str) -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert(USER_AGENT, HeaderValue::from_str(ua).unwrap_or_else(|_| {
@@ -82,7 +147,7 @@ fn non_fingerprintable_base_headers(ua: &str) -> HeaderMap {
 }
 
 #[cfg(test)]
-mod tests {
+mod header_tests {
     use super::non_fingerprintable_base_headers;
 
     #[test]
@@ -517,6 +582,23 @@ mod tests {
         );
         assert_eq!(response.header("cache-control"), Some("no-store"));
         assert_eq!(response.body, b"{}");
+    }
+
+    #[tokio::test]
+    async fn blocked_tracker_document_gets_minimal_html_body() {
+        let mut client = ObscuraHttpClient::new();
+        client.block_trackers = true;
+
+        let url = Url::parse("https://doubleclick.net/track").unwrap();
+        let response = client.fetch(&url).await.unwrap();
+
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            response.header("content-type"),
+            Some("text/html; charset=utf-8")
+        );
+        assert_eq!(response.header("cache-control"), Some("no-store"));
+        assert!(!response.body.is_empty());
     }
 }
 

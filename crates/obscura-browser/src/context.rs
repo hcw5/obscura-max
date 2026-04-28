@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use obscura_net::{BlocklistConfig, CookieJar, ObscuraHttpClient, RobotsCache};
+use obscura_stealth::load_profile_by_id;
 
 pub struct BrowserContext {
     pub id: String,
@@ -59,6 +60,18 @@ impl BrowserContext {
             stealth,
             tracker_blocklist_config,
         }
+    }
+
+    pub fn with_profile(
+        id: String,
+        profile_id: &str,
+        proxy_url: Option<String>,
+        stealth: bool,
+    ) -> Self {
+        let profile = load_profile_by_id(profile_id);
+        let mut context = Self::with_options(id, proxy_url, stealth);
+        context.user_agent = profile.user_agent;
+        context
     }
 
     pub fn with_proxy(id: String, proxy_url: Option<String>) -> Self {

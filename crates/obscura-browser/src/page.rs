@@ -193,58 +193,82 @@ impl Page {
     }
 
     async fn execute_scripts(&mut self) {
-        tracing::info!(
-            "execute_scripts called, js runtime exists: {}",
-            self.js.is_some()
-        );
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum ScriptKind {
+            ParserBlockingClassic,
+            DeferClassic,
+            DeferModule,
+            AsyncClassic,
+            AsyncModule,
+        }
 
-        #[derive(Debug)]
+        #[derive(Debug, Clone)]
         struct ScriptInfo {
             src: Option<String>,
             inline: String,
-            is_defer: bool,
-            is_async: bool,
-            is_module: bool,
+            kind: ScriptKind,
+        }
+
+        #[derive(Debug)]
+        struct AsyncFetchedScript {
+            script: ScriptInfo,
+            url: String,
+            response: Response,
+            code: String,
         }
 
         let all_scripts = match &self.js {
             Some(js) => js
                 .with_dom(|dom| {
-                    let script_ids = dom.query_selector_all("script").unwrap_or_default();
                     let mut scripts = Vec::new();
+                    for sid in dom.query_selector_all("script").unwrap_or_default() {
+                        let Some(node) = dom.get_node(sid) else {
+                            continue;
+                        };
 
-                    for sid in script_ids {
-                        if let Some(node) = dom.get_node(sid) {
-                            let src = node.get_attribute("src").map(|s| s.to_string());
-                            let script_type = node.get_attribute("type").unwrap_or("").to_string();
-                            let is_defer = node.get_attribute("defer").is_some();
-                            let is_async = node.get_attribute("async").is_some();
-                            let is_module = script_type == "module";
+                        let src = node.get_attribute("src").map(|s| s.to_string());
+                        let script_type = node.get_attribute("type").unwrap_or("").to_string();
+                        let is_defer = node.get_attribute("defer").is_some();
+                        let is_async = node.get_attribute("async").is_some();
+                        let is_module = script_type == "module";
 
-                            if !script_type.is_empty()
-                                && script_type != "text/javascript"
-                                && script_type != "application/javascript"
-                                && script_type != "module"
-                            {
-                                continue;
-                            }
-
-                            let inline_code = if src.is_none() {
-                                dom.text_content(sid)
-                            } else {
-                                String::new()
-                            };
-
-                            if src.is_some() || !inline_code.trim().is_empty() {
-                                scripts.push(ScriptInfo {
-                                    src,
-                                    inline: inline_code,
-                                    is_defer,
-                                    is_async,
-                                    is_module,
-                                });
-                            }
+                        if !script_type.is_empty()
+                            && script_type != "text/javascript"
+                            && script_type != "application/javascript"
+                            && script_type != "module"
+                        {
+                            continue;
                         }
+
+                        let inline_code = if src.is_none() {
+                            dom.text_content(sid)
+                        } else {
+                            String::new()
+                        };
+
+                        if src.is_none() && inline_code.trim().is_empty() {
+                            continue;
+                        }
+
+                        let kind = if is_module {
+                            if is_async {
+                                ScriptKind::AsyncModule
+                            } else {
+                                ScriptKind::DeferModule
+                            }
+                        } else if is_async {
+                            ScriptKind::AsyncClassic
+                        } else if is_defer {
+                            ScriptKind::DeferClassic
+                        } else {
+                            ScriptKind::ParserBlockingClassic
+                        };
+
+                        scripts.push(ScriptInfo {
+                            src,
+                            inline: inline_code,
+                            kind,
+                        });
                     }
                     scripts
                 })
@@ -265,24 +289,14 @@ impl Page {
         };
 
         let mut parser_blocking_classic = Vec::new();
-        let mut defer_classic = Vec::new();
-        let mut async_classic = Vec::new();
-        let mut defer_module = Vec::new();
-        let mut async_module = Vec::new();
+        let mut defer_queue = Vec::new();
+        let mut async_scripts = Vec::new();
 
         for script in all_scripts {
-            if script.is_module {
-                if script.is_async {
-                    async_module.push(script);
-                } else {
-                    defer_module.push(script);
-                }
-            } else if script.is_async {
-                async_classic.push(script);
-            } else if script.is_defer {
-                defer_classic.push(script);
-            } else {
-                parser_blocking_classic.push(script);
+            match script.kind {
+                ScriptKind::ParserBlockingClassic => parser_blocking_classic.push(script),
+                ScriptKind::DeferClassic | ScriptKind::DeferModule => defer_queue.push(script),
+                ScriptKind::AsyncClassic | ScriptKind::AsyncModule => async_scripts.push(script),
             }
         }
         tracing::info!(
@@ -294,6 +308,23 @@ impl Page {
             async_module.len()
         );
 
+            if let Some(js) = &mut page.js {
+                match script.kind {
+                    ScriptKind::DeferModule | ScriptKind::AsyncModule => {
+                        if let Err(e) = js.load_inline_module(&code, url).await {
+                            tracing::warn!("Module script error ({}): {}", url, e);
+                        }
+                    }
+                    _ => {
+                        if let Err(e) = js.execute_script_guarded(url, &code) {
+                            tracing::warn!("Classic script error ({}): {}", url, e);
+                        }
+                    }
+                }
+            }
+        };
+
+        // Phase 1: parser-blocking classic scripts execute synchronously in document order.
         for script in &parser_blocking_classic {
             if let Some(src) = &script.src {
                 let full_url = resolve_script_url(src, self.url.as_ref());
@@ -301,6 +332,7 @@ impl Page {
                     tracing::info!("Blocked parser-blocking script by interception: {}", full_url);
                     continue;
                 }
+
                 let parsed =
                     Url::parse(&full_url).unwrap_or_else(|_| Url::parse("about:blank").unwrap());
                 match self.do_fetch(&parsed).await {
@@ -326,12 +358,8 @@ impl Page {
                         e
                     ),
                 }
-            } else if !script.inline.trim().is_empty() {
-                if let Some(js) = &mut self.js {
-                    if let Err(e) = js.execute_script_guarded("<inline>", &script.inline) {
-                        tracing::warn!("Inline parser-blocking script error: {}", e);
-                    }
-                }
+            } else {
+                execute_inline(self, script, "<inline-parser-blocking>").await;
             }
         }
 
@@ -369,6 +397,8 @@ impl Page {
                         tracing::warn!("Inline defer script error: {}", e);
                     }
                 }
+            } else {
+                execute_inline(self, script, "<inline-defer>").await;
             }
         }
 
@@ -471,10 +501,12 @@ impl Page {
         }
 
         if let Some(js) = &mut self.js {
-            let _ = js.execute_script("<load-events>",
-                "if (typeof window.onload === 'function') { try { window.onload(); } catch(e) {} }\n\
-                 try { document.dispatchEvent(new Event('DOMContentLoaded')); } catch(e) {}\n\
-                 try { window.dispatchEvent(new Event('load')); } catch(e) {}");
+            let _ = js.execute_script(
+                "<load-events>",
+                "if (typeof window.onload === 'function') { try { window.onload(); } catch(e) {} }
+                 try { document.dispatchEvent(new Event('DOMContentLoaded')); } catch(e) {}
+                 try { window.dispatchEvent(new Event('load')); } catch(e) {}",
+            );
         }
 
         if let Some(js) = &mut self.js {
